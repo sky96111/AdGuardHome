@@ -10,6 +10,12 @@ type Client struct {
 	DisallowedRule string      `json:"disallowed_rule"`
 	Disallowed     bool        `json:"disallowed"`
 	IgnoreQueryLog bool        `json:"-"`
+
+	// IDs contains the client's identifiers, such as IP addresses and
+	// ClientIDs.  It's only set by the clients enumeration used to push the
+	// client-name search criteria and the per-client ignore settings down to
+	// the database, and it isn't serialized.
+	IDs []string `json:"-"`
 }
 
 // clientCacheKey is the key by which a cached client information is found.

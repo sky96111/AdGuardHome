@@ -333,6 +333,44 @@ func (clients *clientsContainer) findMultiple(ids []string) (c *querylog.Client,
 	return artClient, nil
 }
 
+// findQueryLogClients returns information about all the known clients for the
+// query log.  It's used to push the client-name search criteria and the
+// per-client query log ignore settings down to the query log database.  The
+// IDs of the returned clients contain their IP addresses and ClientIDs.
+func (clients *clientsContainer) findQueryLogClients() (cs []*querylog.Client) {
+	clients.storage.RangeByName(func(cli *client.Persistent) (cont bool) {
+		qc := &querylog.Client{
+			Name:           cli.Name,
+			IgnoreQueryLog: cli.IgnoreQueryLog,
+		}
+
+		for _, ip := range cli.IPs {
+			qc.IDs = append(qc.IDs, ip.String())
+		}
+
+		for _, cid := range cli.ClientIDs {
+			qc.IDs = append(qc.IDs, string(cid))
+		}
+
+		cs = append(cs, qc)
+
+		return true
+	})
+
+	clients.storage.RangeRuntime(func(rc *client.Runtime) (cont bool) {
+		_, host := rc.Info()
+
+		cs = append(cs, &querylog.Client{
+			Name: host,
+			IDs:  []string{rc.Addr().String()},
+		})
+
+		return true
+	})
+
+	return cs
+}
+
 // clientOrArtificial returns information about one client.  If art is true,
 // this is an artificial client record, meaning that we currently don't have any
 // records about this client besides maybe whether or not it is blocked.  c is

@@ -1,7 +1,6 @@
 package querylog
 
 import (
-	"fmt"
 	"net"
 	"testing"
 
@@ -59,7 +58,7 @@ func TestQueryLog(t *testing.T) {
 	entryRoot := entries[4]
 	entryRootWant := &logEntry{QHost: ".", Answer: entryRoot.Answer, IP: entryRoot.IP}
 
-	l, err := newQueryLog(Config{
+	l, err := newQueryLog(testutil.ContextWithTimeout(t, testTimeout), Config{
 		Logger:      testLogger,
 		Enabled:     true,
 		FileEnabled: true,
@@ -73,15 +72,12 @@ func TestQueryLog(t *testing.T) {
 
 	// Add disk entries.
 	addTestEntry(l, entry1.QHost, entry1.Answer, entry1.IP, filtering.Rewritten)
-	// Write to disk (first file).
+	// Write them to the database.
 	require.NoError(t, l.flushLogBuffer(ctx))
-
-	// Start writing to the second file.
-	require.NoError(t, l.rotate(ctx))
 
 	// Add disk entries.
 	addTestEntry(l, entry2.QHost, entry2.Answer, entry2.IP, filtering.Rewritten)
-	// Write to disk.
+	// Write them to the database.
 	require.NoError(t, l.flushLogBuffer(ctx))
 
 	// Add memory entries.
@@ -135,9 +131,10 @@ func TestQueryLog(t *testing.T) {
 }
 
 func TestQueryLogOffsetLimit(t *testing.T) {
-	l, err := newQueryLog(Config{
+	l, err := newQueryLog(testutil.ContextWithTimeout(t, testTimeout), Config{
 		Logger:      testLogger,
 		Enabled:     true,
+		FileEnabled: true,
 		RotationIvl: timeutil.Day,
 		MemSize:     100,
 		BaseDir:     t.TempDir(),
@@ -225,45 +222,8 @@ func TestQueryLogOffsetLimit(t *testing.T) {
 	}
 }
 
-func TestQueryLogMaxFileScanEntries(t *testing.T) {
-	l, err := newQueryLog(Config{
-		Logger:      testLogger,
-		Enabled:     true,
-		FileEnabled: true,
-		RotationIvl: timeutil.Day,
-		MemSize:     100,
-		BaseDir:     t.TempDir(),
-	})
-	require.NoError(t, err)
-
-	ctx := testutil.ContextWithTimeout(t, testTimeout)
-
-	const entNum = 10
-	// Add entries to the log.
-	for range entNum {
-		addTestEntry(
-			l,
-			"example.org",
-			testAnswerIPv4,
-			testClientIPv4,
-			filtering.Rewritten,
-		)
-	}
-	// Write them to disk.
-	require.NoError(t, l.flushLogBuffer(ctx))
-
-	params := newSearchParams()
-	for _, maxFileScanEntries := range []int{5, 0} {
-		t.Run(fmt.Sprintf("limit_%d", maxFileScanEntries), func(t *testing.T) {
-			params.maxFileScanEntries = maxFileScanEntries
-			entries, _ := l.search(ctx, params)
-			assert.Len(t, entries, entNum-maxFileScanEntries)
-		})
-	}
-}
-
 func TestQueryLogFileDisabled(t *testing.T) {
-	l, err := newQueryLog(Config{
+	l, err := newQueryLog(testutil.ContextWithTimeout(t, testTimeout), Config{
 		Logger:      testLogger,
 		Enabled:     true,
 		FileEnabled: false,
@@ -311,7 +271,7 @@ func TestQueryLogShouldLog(t *testing.T) {
 		return &Client{IgnoreQueryLog: log}, nil
 	}
 
-	l, err := newQueryLog(Config{
+	l, err := newQueryLog(testutil.ContextWithTimeout(t, testTimeout), Config{
 		Ignored:     engine,
 		Enabled:     true,
 		RotationIvl: timeutil.Day,

@@ -36,7 +36,9 @@ func TestQueryLog_Search_findClient(t *testing.T) {
 		return nil, nil
 	}
 
-	l, err := newQueryLog(Config{
+	ctx := testutil.ContextWithTimeout(t, testTimeout)
+
+	l, err := newQueryLog(ctx, Config{
 		Logger:            testLogger,
 		FindClient:        findClient,
 		BaseDir:           t.TempDir(),
@@ -48,7 +50,6 @@ func TestQueryLog_Search_findClient(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	ctx := testutil.ContextWithTimeout(t, testTimeout)
 	testutil.CleanupAndRequireSuccess(t, func() (err error) {
 		return l.Shutdown(ctx)
 	})

@@ -83,6 +83,7 @@ func initDNS(
 		ConfigModifier:    confModifier,
 		HTTPReg:           httpReg,
 		FindClient:        globalContext.clients.findMultiple,
+		FindClients:       globalContext.clients.findQueryLogClients,
 		BaseDir:           querylogDir,
 		AnonymizeClientIP: config.DNS.AnonymizeClientIP,
 		RotationIvl:       time.Duration(config.QueryLog.Interval),
@@ -97,7 +98,7 @@ func initDNS(
 	}
 
 	conf.Ignored = engine
-	globalContext.queryLog, err = querylog.New(conf)
+	globalContext.queryLog, err = querylog.New(ctx, conf)
 	if err != nil {
 		return fmt.Errorf("init querylog: %w", err)
 	}

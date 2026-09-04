@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os"
 	"sync"
 	"time"
 
@@ -17,10 +16,6 @@ import (
 	"github.com/AdguardTeam/golibs/timeutil"
 	"github.com/miekg/dns"
 )
-
-// queryLogFileName is a name of the log file.  ".gz" extension is added later
-// during compression.
-const queryLogFileName = "querylog.json"
 
 // queryLog is a structure that writes and reads the DNS query log.
 type queryLog struct {
@@ -36,19 +31,25 @@ type queryLog struct {
 
 	findClient func(ids []string) (c *Client, err error)
 
+	// findClients returns information about all the known clients, if any.
+	// It is used to push the client-name search criteria and the per-client
+	// ignore settings down to the database.
+	findClients func() (cs []*Client)
+
 	// buffer contains recent log entries.  The entries in this buffer must not
 	// be modified.
 	buffer *container.RingBuffer[*logEntry]
 
-	// logFile is the path to the log file.
-	logFile string
+	// store is the SQLite-backed storage of the query log.  It is nil if the
+	// query log works in the memory-only mode, i.e. FileEnabled is false.
+	store *store
 
 	// bufferLock protects buffer.
 	bufferLock sync.RWMutex
 
-	// fileFlushLock synchronizes a file-flushing goroutine and main thread.
-	fileFlushLock sync.Mutex
-	fileWriteLock sync.Mutex
+	// flushLock synchronizes a flushing goroutine with searching and
+	// clearing.
+	flushLock sync.Mutex
 
 	flushPending bool
 }
@@ -91,7 +92,7 @@ func (l *queryLog) Start(ctx context.Context) (err error) {
 		l.initWeb()
 	}
 
-	go l.periodicRotate(ctx)
+	go l.periodicRetention(ctx)
 
 	return nil
 }
@@ -101,15 +102,17 @@ func (l *queryLog) Shutdown(ctx context.Context) (err error) {
 	l.confMu.RLock()
 	defer l.confMu.RUnlock()
 
-	if l.conf.FileEnabled {
-		err = l.flushLogBuffer(ctx)
-		if err != nil {
-			// Don't wrap the error because it's informative enough as is.
-			return err
-		}
+	if l.store == nil {
+		return nil
 	}
 
-	return nil
+	err = l.flushLogBuffer(ctx)
+	if err != nil {
+		// Don't wrap the error because it's informative enough as is.
+		return err
+	}
+
+	return l.store.Close(ctx)
 }
 
 func checkInterval(ivl time.Duration) (ok bool) {
@@ -145,38 +148,6 @@ func (l *queryLog) WriteDiskConfig(c *Config) {
 	defer l.confMu.RUnlock()
 
 	*c = *l.conf
-}
-
-// Clear memory buffer and remove log files
-func (l *queryLog) clear(ctx context.Context) {
-	l.fileFlushLock.Lock()
-	defer l.fileFlushLock.Unlock()
-
-	func() {
-		l.bufferLock.Lock()
-		defer l.bufferLock.Unlock()
-
-		l.buffer.Clear()
-		l.flushPending = false
-	}()
-
-	oldLogFile := l.logFile + ".1"
-	err := os.Remove(oldLogFile)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		l.logger.ErrorContext(
-			ctx,
-			"removing old log file",
-			"file", oldLogFile,
-			slogutil.KeyError, err,
-		)
-	}
-
-	err = os.Remove(l.logFile)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		l.logger.ErrorContext(ctx, "removing log file", "file", l.logFile, slogutil.KeyError, err)
-	}
-
-	l.logger.DebugContext(ctx, "cleared")
 }
 
 // newLogEntry creates an instance of logEntry from parameters.

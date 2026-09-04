@@ -345,11 +345,12 @@ type queryLogConfig struct {
 	// "." is considered to be the root domain.
 	Ignored []string `yaml:"ignored"`
 
-	// Interval is the interval for query log's files rotation.
+	// Interval is the interval for the query log retention.  The entries
+	// older than the interval are removed from the log database.
 	Interval timeutil.Duration `yaml:"interval"`
 
 	// MemSize is the number of entries kept in memory before they are flushed
-	// to disk.
+	// to the log database.
 	MemSize uint `yaml:"size_memory"`
 
 	// Enabled defines if the query log is enabled.
@@ -359,7 +360,8 @@ type queryLogConfig struct {
 	// ignored.
 	IgnoredEnabled bool `yaml:"ignored_enabled"`
 
-	// FileEnabled defines, if the query log is written to the file.
+	// FileEnabled defines, if the query log is written to the database.
+	// Otherwise, the query log works in the memory-only mode.
 	FileEnabled bool `yaml:"file_enabled"`
 }
 

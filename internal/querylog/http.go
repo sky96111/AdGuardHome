@@ -456,10 +456,6 @@ func (l *queryLog) parseSearchParams(
 	var offset64 int64
 	if offset64, err = strconv.ParseInt(q.Get("offset"), 10, 64); err == nil {
 		p.offset = int(offset64)
-
-		// If we don't use "olderThan" and use offset/limit instead, we should change the default behavior
-		// and scan all log records until we found enough log entries
-		p.maxFileScanEntries = 0
 	}
 
 	err = l.parseSearchCriterions(ctx, q, p)

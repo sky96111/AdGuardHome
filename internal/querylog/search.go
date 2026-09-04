@@ -2,14 +2,12 @@ package querylog
 
 import (
 	"context"
-	"fmt"
-	"io"
-	"log/slog"
 	"slices"
+	"strings"
 	"time"
 
-	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/logutil/slogutil"
+	"github.com/AdguardTeam/golibs/stringutil"
 )
 
 // client finds the client info, if any, by its ClientID and IP address,
@@ -94,8 +92,9 @@ func (l *queryLog) searchMemory(
 	return entries, int(l.buffer.Len())
 }
 
-// search searches log entries in memory buffer and log file using specified
-// parameters and returns the list of entries found and the time of the oldest
+// search searches log entries in the database, or in the memory buffer if the
+// query log works in the memory-only mode, using the specified parameters and
+// returns the list of the entries found and the time of the oldest returned
 // entry.  l.confMu is expected to be locked.
 func (l *queryLog) search(
 	ctx context.Context,
@@ -107,35 +106,71 @@ func (l *queryLog) search(
 		return []*logEntry{}, time.Time{}
 	}
 
-	cache := clientCache{}
+	if l.store == nil {
+		cache := clientCache{}
 
-	memoryEntries, bufLen := l.searchMemory(ctx, params, cache)
-	l.logger.DebugContext(ctx, "got entries from memory", "count", len(memoryEntries))
+		memoryEntries, _ := l.searchMemory(ctx, params, cache)
+		entries, oldest = l.finalizeSearchResults(memoryEntries, params, time.Time{})
+	} else {
+		// Make sure that all the buffered entries are in the store, so that
+		// the search covers them as well.
+		err := l.flushLogBuffer(ctx)
+		if err != nil {
+			l.logger.ErrorContext(ctx, "flushing buffer before search", slogutil.KeyError, err)
+		}
 
-	fileEntries, oldest, total := l.searchFiles(ctx, params, cache)
-	l.logger.DebugContext(ctx, "got entries from files", "count", len(fileEntries))
-
-	total += bufLen
-
-	totalLimit := params.offset + params.limit
-
-	// now let's get a unified collection
-	entries = append(memoryEntries, fileEntries...)
-	if len(entries) > totalLimit {
-		// remove extra records
-		entries = entries[:totalLimit]
+		entries, oldest = l.searchStore(ctx, params)
 	}
-
-	entries, oldest = l.finalizeSearchResults(entries, params, oldest)
 
 	l.logger.DebugContext(
 		ctx,
 		"prepared data",
 		"count", len(entries),
-		"total", total,
 		"older_than", params.olderThan,
 		"elapsed", time.Since(start),
 	)
+
+	return entries, oldest
+}
+
+// searchStore searches the database using the specified parameters.  The
+// returned entries are enriched with the client information.
+func (l *queryLog) searchStore(
+	ctx context.Context,
+	params *searchParams,
+) (entries []*logEntry, oldest time.Time) {
+	term, strict := searchTerm(params)
+	lists := l.clientIDLists(ctx, term, strict)
+
+	sq := buildSearchQuery(params, lists)
+
+	entries, err := l.store.search(ctx, sq, params.limit, params.offset)
+	if err != nil {
+		l.logger.ErrorContext(ctx, "searching entries", slogutil.KeyError, err)
+
+		return nil, time.Time{}
+	}
+
+	cache := clientCache{}
+	for _, e := range entries {
+		e.client, err = l.client(e.ClientID, e.IP.String(), cache)
+		if err != nil {
+			l.logger.ErrorContext(
+				ctx,
+				"enriching record",
+				"at", e.Time,
+				"client_ip", e.IP,
+				"client_id", e.ClientID,
+				slogutil.KeyError, err,
+			)
+
+			// Go on anyway.
+		}
+	}
+
+	if len(entries) > 0 {
+		oldest = entries[len(entries)-1].Time
+	}
 
 	return entries, oldest
 }
@@ -171,207 +206,65 @@ func (l *queryLog) finalizeSearchResults(
 	return entries, oldest
 }
 
-// seekRecord changes the current position to the next record older than the
-// provided parameter.
-func (r *qLogReader) seekRecord(ctx context.Context, olderThan time.Time) (err error) {
-	if olderThan.IsZero() {
-		return r.SeekStart()
-	}
-
-	err = r.seekTS(ctx, olderThan.UnixNano())
-	if err == nil {
-		// Read to the next record, because we only need the one that goes
-		// after it.
-		_, err = r.ReadNext()
-	}
-
-	return err
-}
-
-// setQLogReader creates a reader with the specified files and sets the
-// position to the next record older than the provided parameter.
-func (l *queryLog) setQLogReader(
-	ctx context.Context,
-	olderThan time.Time,
-) (qr *qLogReader, err error) {
-	files := []string{
-		l.logFile + ".1",
-		l.logFile,
-	}
-
-	r, err := newQLogReader(ctx, l.logger, files)
-	if err != nil {
-		return nil, fmt.Errorf("opening qlog reader: %w", err)
-	}
-
-	err = r.seekRecord(ctx, olderThan)
-	if err != nil {
-		defer func() { err = errors.WithDeferred(err, r.Close()) }()
-		l.logger.DebugContext(ctx, "cannot seek", "older_than", olderThan, slogutil.KeyError, err)
-
-		return nil, nil
-	}
-
-	return r, nil
-}
-
-// readEntries reads entries from the reader to totalLimit.  By default, we do
-// not scan more than maxFileScanEntries at once.  The idea is to make search
-// calls faster so that the UI could handle it and show something quicker.
-// This behavior can be overridden if maxFileScanEntries is set to 0.
-func (l *queryLog) readEntries(
-	ctx context.Context,
-	r *qLogReader,
-	params *searchParams,
-	cache clientCache,
-	totalLimit int,
-) (entries []*logEntry, oldestNano int64, total int) {
-	for total < params.maxFileScanEntries || params.maxFileScanEntries <= 0 {
-		ent, ts, rErr := l.readNextEntry(ctx, r, params, cache)
-		if rErr == io.EOF {
-			oldestNano = 0
-
-			break
-		} else if rErr != nil {
-			l.logger.ErrorContext(ctx, "reading next entry", slogutil.KeyError, rErr)
-		}
-
-		oldestNano = ts
-		total++
-
-		if ent == nil {
-			continue
-		}
-
-		entries = append(entries, ent)
-		if len(entries) == totalLimit {
-			break
+// searchTerm returns the free-text search term of the parameters, if any,
+// along with its strictness.
+func searchTerm(params *searchParams) (term string, strict bool) {
+	for _, c := range params.searchCriteria {
+		if c.criterionType == ctTerm {
+			return c.value, c.strict
 		}
 	}
 
-	return entries, oldestNano, total
+	return "", false
 }
 
-// searchFiles looks up log records from all log files.  It optionally uses the
-// client cache, if provided.  searchFiles does not scan more than
-// maxFileScanEntries so callers may need to call it several times to get all
-// the results.  oldest and total are the time of the oldest processed entry
-// and the total number of processed entries, including discarded ones,
-// correspondingly.
-func (l *queryLog) searchFiles(
-	ctx context.Context,
-	params *searchParams,
-	cache clientCache,
-) (entries []*logEntry, oldest time.Time, total int) {
-	r, err := l.setQLogReader(ctx, params.olderThan)
-	if err != nil {
-		l.logger.ErrorContext(ctx, "searching files", slogutil.KeyError, err)
+// clientIDLists contains the client IDs resolved for a search.
+type clientIDLists struct {
+	// byName contains the IDs of the clients whose names match the free-text
+	// search term of the search, if any.
+	byName []any
+
+	// ignored contains the IDs of the clients that must not be logged.
+	ignored []any
+}
+
+// clientIDLists resolves the client IDs used to push the client-name search
+// criterion and the per-client ignore settings down to the database.  term may
+// be empty, in which case byName is empty.
+func (l *queryLog) clientIDLists(ctx context.Context, term string, strict bool) (lists clientIDLists) {
+	if l.findClients == nil {
+		return clientIDLists{}
 	}
 
-	if r == nil {
-		return entries, oldest, 0
-	}
-
-	defer func() {
-		if closeErr := r.Close(); closeErr != nil {
-			l.logger.ErrorContext(ctx, "closing files", slogutil.KeyError, closeErr)
+	for _, c := range l.findClients() {
+		if c.IgnoreQueryLog {
+			lists.ignored = append(lists.ignored, nonEmptyIDs(c)...)
 		}
-	}()
 
-	totalLimit := params.offset + params.limit
-	entries, oldestNano, total := l.readEntries(ctx, r, params, cache, totalLimit)
-	if oldestNano != 0 {
-		oldest = time.Unix(0, oldestNano)
+		if term != "" && nameMatchesTerm(c.Name, term, strict) {
+			lists.byName = append(lists.byName, nonEmptyIDs(c)...)
+		}
 	}
 
-	return entries, oldest, total
+	return lists
 }
 
-// quickMatchClientFinder is a wrapper around the usual client finding function
-// to make it easier to use with quick matches.
-type quickMatchClientFinder struct {
-	client func(clientID, ip string, cache clientCache) (c *Client, err error)
-	cache  clientCache
+// nameMatchesTerm returns true if the client name matches the search term.
+func nameMatchesTerm(name, term string, strict bool) (ok bool) {
+	if strict {
+		return strings.EqualFold(name, term)
+	}
+
+	return stringutil.ContainsFold(name, term)
 }
 
-// findClient is a method that can be used as a quickMatchClientFinder.
-func (f quickMatchClientFinder) findClient(
-	ctx context.Context,
-	logger *slog.Logger,
-	clientID string,
-	ip string,
-) (c *Client) {
-	var err error
-	c, err = f.client(clientID, ip, f.cache)
-	if err != nil {
-		logger.ErrorContext(
-			ctx,
-			"enriching file record for quick search",
-			"client_ip", ip,
-			"client_id", clientID,
-			slogutil.KeyError, err,
-		)
+// nonEmptyIDs returns the non-empty identifiers of the client.
+func nonEmptyIDs(c *Client) (ids []any) {
+	for _, id := range c.IDs {
+		if id != "" {
+			ids = append(ids, id)
+		}
 	}
 
-	return c
-}
-
-// readNextEntry reads the next log entry and checks if it matches the search
-// criteria.  It optionally uses the client cache, if provided.  e is nil if
-// the entry doesn't match the search criteria.  ts is the timestamp of the
-// processed entry.
-func (l *queryLog) readNextEntry(
-	ctx context.Context,
-	r *qLogReader,
-	params *searchParams,
-	cache clientCache,
-) (e *logEntry, ts int64, err error) {
-	var line string
-	line, err = r.ReadNext()
-	if err != nil {
-		return nil, 0, err
-	}
-
-	clientFinder := quickMatchClientFinder{
-		client: l.client,
-		cache:  cache,
-	}
-
-	if !params.quickMatch(ctx, l.logger, line, clientFinder.findClient) {
-		ts = readQLogTimestamp(ctx, l.logger, line)
-
-		return nil, ts, nil
-	}
-
-	e = &logEntry{}
-	l.decodeLogEntry(ctx, e, line)
-
-	if l.isIgnored(e.QHost) {
-		return nil, ts, nil
-	}
-
-	e.client, err = l.client(e.ClientID, e.IP.String(), cache)
-	if err != nil {
-		l.logger.ErrorContext(
-			ctx,
-			"enriching file record",
-			"at", e.Time,
-			"client_ip", e.IP,
-			"client_id", e.ClientID,
-			slogutil.KeyError, err,
-		)
-
-		// Go on and try to match anyway.
-	}
-
-	if e.client != nil && e.client.IgnoreQueryLog {
-		return nil, ts, nil
-	}
-
-	ts = e.Time.UnixNano()
-	if !params.match(e) {
-		return nil, ts, nil
-	}
-
-	return e, ts, nil
+	return ids
 }

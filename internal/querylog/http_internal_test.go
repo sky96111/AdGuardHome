@@ -141,7 +141,7 @@ func TestQuerylog_HandleQueryLog_reasonSearchCriterion(t *testing.T) {
 func newTestQueryLog(tb testing.TB) (l *queryLog) {
 	tb.Helper()
 
-	l, err := newQueryLog(Config{
+	l, err := newQueryLog(testutil.ContextWithTimeout(tb, testTimeout), Config{
 		Logger:      testLogger,
 		Enabled:     true,
 		FileEnabled: true,

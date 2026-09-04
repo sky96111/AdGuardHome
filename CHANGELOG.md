@@ -22,6 +22,12 @@ NOTE: Add new changes BELOW THIS COMMENT.
 
 - Go version has been updated to prevent the possibility of exploiting the Go vulnerabilities fixed in [1.26.8][go-1.26.8].
 
+### Changed
+
+- The query log is now stored in an SQLite database (`querylog.db`) instead of JSON files, using the pure-Go [go-sqlite3] driver.  Search filters are pushed down to the database, which makes searching through large logs much faster, and the free-text search is backed by an FTS5 trigram index.  The existing `querylog.json` and `querylog.json.1` files are no longer read; remove them manually if you don't need the old data.  The actual log retention time is now equal to the configured interval, where it previously was twice the interval.  Note that this increases the resulting binary size.
+
+[go-sqlite3]: https://github.com/ncruces/go-sqlite3
+
 ### Fixed
 
 - DHCP server persisting uncommitted leases with zero expiry after `DHCPDISCOVER` messages ([#8572]).

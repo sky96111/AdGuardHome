@@ -1504,47 +1504,59 @@ Response:
 
 ## Query logs
 
-When a new DNS request is received and processed, we store information about this event in "query log".  It is a file on disk in JSON format:
+When a new DNS request is received and processed, we store information about this event in "query log".  The entries are stored in an SQLite database, `querylog.db` in the query log directory (see also the `querylog.dir_path` configuration setting).  The storage uses the pure-Go [ncruces/go-sqlite3](https://github.com/ncruces/go-sqlite3) driver, which requires no CGO, and runs in the WAL journaling mode.
 
-	{
-	"IP":"127.0.0.1", // client IP
-	"T":"...", // response time
-	"QH":"...", // target host name without the last dot
-	"QT":"...", // question type
-	"QC":"...", // question class
-	"CP":"" | "doh", // client connection protocol
-	"Answer":"base64 data",
-	"OrigAnswer":"base64 data",
-	"Result":{
-		"IsFiltered":true,
-		"Reason":3,
-		"Rule":"...",
-		"FilterID":1,
-		"ServiceName":"..."
-		},
-	"Elapsed":12345,
-	"Upstream":"...",
-	}
+Each entry is stored as a row in the `querylog` table:
 
+| Column        | Description                                          |
+|---------------|------------------------------------------------------|
+| `id`          | The row ID, which also reflects the insertion order.  |
+| `time`        | The response time, as a number of Unix nanoseconds.   |
+| `host`        | The target host name, normalized and lowercased.      |
+| `qtype`       | The question type, e.g. `A`.                          |
+| `qclass`      | The question class, e.g. `IN`.                        |
+| `client_ip`   | The client IP address, in its string form.            |
+| `client_proto`| The client connection protocol, e.g. `doh`.           |
+| `client_id`   | The client ID, if any.                                |
+| `ecs`         | The EDNS Client-Subnet network, if any.               |
+| `upstream`    | The upstream address, if any.                         |
+| `elapsed`     | The request processing time, in nanoseconds.          |
+| `reason`      | The filtering reason code, see `filtering.Reason`.    |
+| `is_filtered` | Whether the request has been filtered.                |
+| `result`      | The full filtering result, as a JSON object.          |
+| `answer`      | The answer message, packed, as a BLOB, if any.        |
+| `orig_answer` | The original upstream answer message, if any.         |
+| `cached`      | Whether the response has been served from cache.      |
+| `ad`          | Whether the response had the `AD` flag set.           |
+
+The `querylog_fts` virtual table, an [FTS5] index with the `trigram` tokenizer over the `host`, `client_ip`, and `client_id` columns, accelerates the free-text substring search.  It's kept in sync with the `querylog` table by triggers.
+
+[FTS5]: https://www.sqlite.org/fts5.html
 
 ### Adding new data
 
-First, new data is stored in a memory region.  When this array is filled to a particular amount of entries (e.g. 5000), we flush this data to a file and clear the array.
+First, new data is stored in a memory buffer.  When this buffer is filled to a particular amount of entries (see the `querylog.size_memory` configuration setting), the data is flushed to the database in a single transaction, and the buffer is cleared.  The buffer is also flushed before each search, so the search results always cover all the recorded entries.
 
 
 ### Getting data
 
-When UI asks for data from query log (see "API: Get query log"), server reads the newest entries from memory array and the file.  The maximum number of items returned per one request is limited by configuration.
+When the UI asks for data from query log (see "API: Get query log"), the search parameters are translated into an SQL query, so that all the filtering is performed by the database:
+
+* The `older_than` cursor and the `limit`/`offset` pagination use the index over the `time` column, and the entries are returned from newest to oldest.
+* The `response_status` and `reason` criteria are translated into predicates over the `reason` and `is_filtered` columns.
+* The free-text `search` criterion is matched against the `host`, `client_ip`, and `client_id` columns.  Exact matches use the indexes over those columns; substring matches of three characters and longer use the FTS index; shorter terms fall back to scanning.  The search term is also matched against the known client names, which is resolved into the list of the matching clients' IDs.
+
+The maximum number of items returned per one request is limited by configuration.
 
 
 ### Removing old data
 
-We store data for a limited amount of time - the log file is automatically rotated.
+We store data for a limited amount of time - the entries older than the configured interval are automatically removed from the database:
 
-* On AGH startup read the first line from query logs and store its time value
-* If there's no log file yet, set the time value of the first log event when the file is created
-* If this time value is older than our time limit, perform file rotate procedure
-* While AGH is running, check the previous condition every 24 hours
+* On AGH startup the outdated entries are removed.
+* While AGH is running, the same check is performed every hour.
+
+The actual retention time is equal to the interval.  Note that the previous file-based storage kept the entries for twice the interval, since it retained two generations of log files.
 
 
 ### API: Get query log

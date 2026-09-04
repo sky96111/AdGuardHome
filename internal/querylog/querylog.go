@@ -1,6 +1,7 @@
 package querylog
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"net"
@@ -58,22 +59,28 @@ type Config struct {
 	// FindClient returns client information by their IDs.
 	FindClient func(ids []string) (c *Client, err error)
 
-	// BaseDir is the base directory for log files.
+	// FindClients returns information about all the known clients.  It's
+	// used to push the client-name search criteria and the per-client ignore
+	// settings down to the database.  It may be nil.
+	FindClients func() (cs []*Client)
+
+	// BaseDir is the base directory for the log database.
 	BaseDir string
 
-	// RotationIvl is the interval for log rotation.  After that period, the old
-	// log file will be renamed, NOT deleted, so the actual log retention time
-	// is twice the interval.
+	// RotationIvl is the interval for the log retention.  The entries older
+	// than the interval are removed from the database.
 	RotationIvl time.Duration
 
-	// MemSize is the number of entries kept in a memory buffer before they are
-	// flushed to disk.
+	// MemSize is the number of entries kept in a memory buffer before they
+	// are flushed to the database.
 	MemSize uint
 
 	// Enabled tells if the query log is enabled.
 	Enabled bool
 
-	// FileEnabled tells if the query log writes logs to files.
+	// FileEnabled tells if the query log writes logs to the database.
+	// Otherwise, the query log works in the memory-only mode, keeping the
+	// logs in the memory buffer only.
 	FileEnabled bool
 
 	// AnonymizeClientIP tells if the query log should anonymize clients' IP
@@ -135,12 +142,12 @@ func (p *AddParams) validate() (err error) {
 }
 
 // New creates a new instance of the query log.
-func New(conf Config) (ql QueryLog, err error) {
-	return newQueryLog(conf)
+func New(ctx context.Context, conf Config) (ql QueryLog, err error) {
+	return newQueryLog(ctx, conf)
 }
 
 // newQueryLog crates a new queryLog.
-func newQueryLog(conf Config) (l *queryLog, err error) {
+func newQueryLog(ctx context.Context, conf Config) (l *queryLog, err error) {
 	findClient := conf.FindClient
 	if findClient == nil {
 		findClient = func(_ []string) (_ *Client, _ error) {
@@ -150,20 +157,20 @@ func newQueryLog(conf Config) (l *queryLog, err error) {
 
 	memSize := conf.MemSize
 	if memSize == 0 {
-		// If query log is enabled, we still need to write entries to a file.
-		// And all writing goes through a buffer.
+		// If query log is enabled, we still need to write entries to the
+		// database.  And all writing goes through a buffer.
 		memSize = 1
 	}
 
 	l = &queryLog{
-		logger:     conf.Logger,
-		findClient: findClient,
+		logger:      conf.Logger,
+		findClient:  findClient,
+		findClients: conf.FindClients,
 
 		buffer: container.NewRingBuffer[*logEntry](memSize),
 
-		conf:    &Config{},
-		confMu:  &sync.RWMutex{},
-		logFile: filepath.Join(conf.BaseDir, queryLogFileName),
+		conf:   &Config{},
+		confMu: &sync.RWMutex{},
 
 		anonymizer: conf.Anonymizer,
 	}
@@ -173,6 +180,13 @@ func newQueryLog(conf Config) (l *queryLog, err error) {
 	err = validateIvl(conf.RotationIvl)
 	if err != nil {
 		return nil, fmt.Errorf("unsupported interval: %w", err)
+	}
+
+	if conf.FileEnabled {
+		l.store, err = newStore(ctx, conf.Logger, filepath.Join(conf.BaseDir, querylogDBFileName))
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return l, nil
