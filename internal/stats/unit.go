@@ -1,9 +1,7 @@
 package stats
 
 import (
-	"bytes"
-	"encoding/binary"
-	"encoding/gob"
+	"context"
 	"fmt"
 	"maps"
 	"slices"
@@ -12,8 +10,6 @@ import (
 	"github.com/AdguardTeam/AdGuardHome/internal/aghnet"
 	"github.com/AdguardTeam/dnsproxy/proxy"
 	"github.com/AdguardTeam/golibs/errors"
-	"github.com/AdguardTeam/golibs/logutil/slogutil"
-	"go.etcd.io/bbolt"
 )
 
 const (
@@ -141,17 +137,16 @@ func newUnit(id uint32) (u *unit) {
 	}
 }
 
-// countPair is a single name-number pair for deserializing statistics data into
-// the database.
+// countPair is a single name-number pair used to store the per-name counters.
 type countPair struct {
 	Name  string
 	Count uint64
 }
 
-// unitDB is the structure for serializing statistics data into the database.
-//
-// NOTE: Do not change the names or types of fields, as this structure is used
-// for GOB encoding.
+// unitDB is the structure for serializing statistics data into the database
+// and aggregating it back.  The top lists are capped by the max* constants at
+// the serialization time, so the data beyond those lists is discarded, just
+// like in the previous storage.
 type unitDB struct {
 	// NResult is the number of requests by the result's kind.
 	NResult []uint64
@@ -175,9 +170,9 @@ type unitDB struct {
 	// NTotal is the total number of requests.
 	NTotal uint64
 
-	// TimeAvg is the average of processing times in microseconds of all the
+	// TimeSumUs is the sum of processing times in microseconds of all the
 	// requests in the unit.
-	TimeAvg uint32
+	TimeSumUs uint64
 }
 
 // newUnitID is the default UnitIDGenFunc that generates the unique id hourly.
@@ -185,40 +180,6 @@ func newUnitID() (id uint32) {
 	const secsInHour = int64(time.Hour / time.Second)
 
 	return uint32(time.Now().Unix() / secsInHour)
-}
-
-func finishTxn(tx *bbolt.Tx, commit bool) (err error) {
-	if commit {
-		err = errors.Annotate(tx.Commit(), "committing: %w")
-	} else {
-		err = errors.Annotate(tx.Rollback(), "rolling back: %w")
-	}
-
-	return err
-}
-
-// bucketNameLen is the length of a bucket, a 64-bit unsigned integer.
-//
-// TODO(a.garipov): Find out why a 64-bit integer is used when IDs seem to
-// always be 32 bits.
-const bucketNameLen = 8
-
-// idToUnitName converts a numerical ID into a database unit name.
-func idToUnitName(id uint32) (name []byte) {
-	n := [bucketNameLen]byte{}
-	binary.BigEndian.PutUint64(n[:], uint64(id))
-
-	return n[:]
-}
-
-// unitNameToID converts a database unit name into a numerical ID.  ok is false
-// if name is not a valid database unit name.
-func unitNameToID(name []byte) (id uint32, ok bool) {
-	if len(name) < bucketNameLen {
-		return 0, false
-	}
-
-	return uint32(binary.BigEndian.Uint64(name)), true
 }
 
 // compareCount used to sort countPair by Count in descending order.
@@ -254,13 +215,9 @@ func convertSliceToMap(a []countPair) (m map[string]uint64) {
 }
 
 // serialize converts u to the *unitDB.  It's safe for concurrent use.  u must
-// not be nil.
+// not be nil.  The per-name counters beyond the top max* lists are discarded,
+// which is the same behavior the previous storage had.
 func (u *unit) serialize() (udb *unitDB) {
-	var timeAvg uint32 = 0
-	if u.nTotal != 0 {
-		timeAvg = uint32(u.timeSum / u.nTotal)
-	}
-
 	return &unitDB{
 		NTotal:             u.nTotal,
 		NResult:            append([]uint64{}, u.nResult...),
@@ -269,35 +226,13 @@ func (u *unit) serialize() (udb *unitDB) {
 		Clients:            convertMapToSlice(u.clients, maxClients),
 		UpstreamsResponses: convertMapToSlice(u.upstreamsResponses, maxUpstreams),
 		UpstreamsTimeSum:   convertMapToSlice(u.upstreamsTimeSum, maxUpstreams),
-		TimeAvg:            timeAvg,
+		TimeSumUs:          u.timeSum,
 	}
-}
-
-// loadUnitFromDB loads unit by id from the database.
-func (s *StatsCtx) loadUnitFromDB(tx *bbolt.Tx, id uint32) (udb *unitDB) {
-	bkt := tx.Bucket(idToUnitName(id))
-	if bkt == nil {
-		return nil
-	}
-
-	s.logger.Debug("loading unit", "id", id)
-
-	var buf bytes.Buffer
-	buf.Write(bkt.Get([]byte{0}))
-	udb = &unitDB{}
-
-	err := gob.NewDecoder(&buf).Decode(udb)
-	if err != nil {
-		s.logger.Error("gob decode", slogutil.KeyError, err)
-
-		return nil
-	}
-
-	return udb
 }
 
 // deserialize assigns the appropriate values from udb to u.  u must not be nil.
-// It's safe for concurrent use.
+// It's safe for concurrent use.  udb may be nil, in which case u isn't
+// changed.
 func (u *unit) deserialize(udb *unitDB) {
 	if udb == nil {
 		return
@@ -311,7 +246,7 @@ func (u *unit) deserialize(udb *unitDB) {
 	u.clients = convertSliceToMap(udb.Clients)
 	u.upstreamsResponses = convertSliceToMap(udb.UpstreamsResponses)
 	u.upstreamsTimeSum = convertSliceToMap(udb.UpstreamsTimeSum)
-	u.timeSum = uint64(udb.TimeAvg) * udb.NTotal
+	u.timeSum = udb.TimeSumUs
 }
 
 // add adds new data to u.  It's safe for concurrent use.
@@ -337,29 +272,6 @@ func (u *unit) add(e *Entry) {
 		u.upstreamsResponses[addr]++
 		u.upstreamsTimeSum[addr] += uint64(s.QueryDuration.Microseconds())
 	}
-}
-
-// flushUnitToDB puts udb to the database at id.
-func (s *StatsCtx) flushUnitToDB(udb *unitDB, tx *bbolt.Tx, id uint32) (err error) {
-	s.logger.Debug("flushing unit", "id", id, "req_num", udb.NTotal)
-
-	bkt, err := tx.CreateBucketIfNotExists(idToUnitName(id))
-	if err != nil {
-		return fmt.Errorf("creating bucket: %w", err)
-	}
-
-	buf := &bytes.Buffer{}
-	err = gob.NewEncoder(buf).Encode(udb)
-	if err != nil {
-		return fmt.Errorf("encoding unit: %w", err)
-	}
-
-	err = bkt.Put([]byte{0}, buf.Bytes())
-	if err != nil {
-		return fmt.Errorf("putting unit to database: %w", err)
-	}
-
-	return nil
 }
 
 func convertTopSlice(a []countPair) (m []map[string]uint64) {
@@ -392,24 +304,20 @@ func topsCollector(units []*unitDB, max int, ignored *aghnet.IgnoreEngine, pg pa
 
 // getData returns the statistics data using the following algorithm:
 //
-//  1. Prepare a slice of N units, where N is the value of "limit" configuration
-//     setting.  Load data for the most recent units from the file.  If a unit
-//     with required ID doesn't exist, just add an empty unit.  Get data for the
-//     current unit.
+//  1. Load the pre-aggregated statistics for the buckets in the
+//     [curID - limit + 1, curID) range from the database, where curID is the
+//     current unit's ID.  Missing buckets are treated as empty.  Merge in the
+//     current unit's data.
 //
-//  2. Process data from the units and prepare an output map object, including
-//     per time unit counters (DNS queries per time-unit, blocked queries per
-//     time unit, etc.).  If the time unit is hour, just add values from each
-//     unit to the slice; otherwise, the time unit is day, so aggregate per-hour
-//     data into days.
+//  2. Prepare an output object, including per time unit counters (DNS queries
+//     per time-unit, blocked queries per time unit, etc.).  If the time unit
+//     is hour, just add the per-bucket values to the slice; otherwise, the
+//     time unit is day, so aggregate the per-hour data into days.
 //
-//     To get the top counters (queries per domain, queries per blocked domain,
-//     etc.), first sum up data for all units into a single map.  Then,  get the
-//     pairs with the highest numbers.
-//
-//     The total counters (DNS queries, blocked, etc.) are just the sum of data
-//     for all units.
-func (s *StatsCtx) getData(limit uint32) (resp *StatsResp, ok bool) {
+//     To get the top counters (queries per domain, queries per blocked
+//     domain, etc.), the database returns the top pairs of the whole range,
+//     which are then merged with the current unit's data.
+func (s *StatsCtx) getData(ctx context.Context, limit uint32) (resp *StatsResp, ok bool) {
 	if limit == 0 {
 		return &StatsResp{
 			TimeUnits: "days",
@@ -427,16 +335,49 @@ func (s *StatsCtx) getData(limit uint32) (resp *StatsResp, ok bool) {
 		}, true
 	}
 
-	units, curID := s.loadUnits(limit)
-	if units == nil {
+	dbAgg, perBucketMap, dbTimeSumUs, curSnap, curID, ok := s.loadUnits(limit)
+	if !ok {
 		return &StatsResp{}, false
 	}
 
-	return s.dataFromUnits(units, curID), true
+	// Collect the per-bucket counters into an ordered series, merging the
+	// current unit's data into its own bucket.
+	firstID := curID - limit + 1
+	perBucket := make([][resultLast]uint64, limit)
+	for bucket, nResult := range perBucketMap {
+		if bucket < firstID || bucket >= curID {
+			// Should not happen.
+			continue
+		}
+
+		copy(perBucket[bucket-firstID][:], nResult)
+	}
+
+	if curSnap != nil {
+		last := &perBucket[limit-1]
+		for r, count := range curSnap.NResult {
+			last[r] += count
+		}
+
+		dbTimeSumUs += curSnap.TimeSumUs
+	}
+
+	return s.dataFromAggregates(dbAgg, perBucket, dbTimeSumUs, curSnap, curID), true
 }
 
-// dataFromUnits collects and returns the statistics data.
-func (s *StatsCtx) dataFromUnits(units []*unitDB, curID uint32) (resp *StatsResp) {
+// dataFromAggregates collects and returns the statistics data.  perBucket
+// contains the per-bucket result counters of the whole requested range,
+// ordered from the oldest bucket to the current one, including the current
+// unit's data in the last bucket.
+func (s *StatsCtx) dataFromAggregates(
+	dbAgg *unitDB,
+	perBucket [][resultLast]uint64,
+	dbTimeSumUs uint64,
+	curSnap *unitDB,
+	curID uint32,
+) (resp *StatsResp) {
+	units := []*unitDB{dbAgg, curSnap}
+
 	topUpstreamsResponses, topUpstreamsAvgTime := topUpstreamsPairs(units)
 
 	resp = &StatsResp{
@@ -447,41 +388,54 @@ func (s *StatsCtx) dataFromUnits(units []*unitDB, curID uint32) (resp *StatsResp
 		TopClients:            topsCollector(units, maxClients, nil, topClientPairs(s)),
 	}
 
-	s.fillCollectedStats(resp, units, curID)
+	s.fillCollectedStats(resp, perBucket, curID)
 
-	// Total counters:
-	sum := unitDB{
-		NResult: make([]uint64, resultLast),
-	}
-	var timeN uint32
-	for _, u := range units {
-		sum.NTotal += u.NTotal
-		sum.TimeAvg += u.TimeAvg
-		if u.TimeAvg != 0 {
-			timeN++
+	// Total counters.  The total number of requests is the sum of the
+	// per-result counters.
+	var (
+		numDNSQueries       uint64
+		numBlockedFiltering uint64
+		numSafebrowsing     uint64
+		numSafesearch       uint64
+		numParental         uint64
+	)
+	for _, nResult := range perBucket {
+		for r, count := range nResult {
+			numDNSQueries += count
+
+			switch Result(r) {
+			case RFiltered:
+				numBlockedFiltering += count
+			case RSafeBrowsing:
+				numSafebrowsing += count
+			case RSafeSearch:
+				numSafesearch += count
+			case RParental:
+				numParental += count
+			default:
+				// NotFiltered isn't shown in the response.
+			}
 		}
-		sum.NResult[RFiltered] += u.NResult[RFiltered]
-		sum.NResult[RSafeBrowsing] += u.NResult[RSafeBrowsing]
-		sum.NResult[RSafeSearch] += u.NResult[RSafeSearch]
-		sum.NResult[RParental] += u.NResult[RParental]
 	}
 
-	resp.NumDNSQueries = sum.NTotal
-	resp.NumBlockedFiltering = sum.NResult[RFiltered]
-	resp.NumReplacedSafebrowsing = sum.NResult[RSafeBrowsing]
-	resp.NumReplacedSafesearch = sum.NResult[RSafeSearch]
-	resp.NumReplacedParental = sum.NResult[RParental]
+	resp.NumDNSQueries = numDNSQueries
+	resp.NumBlockedFiltering = numBlockedFiltering
+	resp.NumReplacedSafebrowsing = numSafebrowsing
+	resp.NumReplacedSafesearch = numSafesearch
+	resp.NumReplacedParental = numParental
 
-	if timeN != 0 {
-		resp.AvgProcessingTime = microsecondsToSeconds(float64(sum.TimeAvg / timeN))
+	if numDNSQueries != 0 {
+		resp.AvgProcessingTime = microsecondsToSeconds(float64(dbTimeSumUs) / float64(numDNSQueries))
 	}
 
 	return resp
 }
 
-// fillCollectedStats fills data with collected statistics.
-func (s *StatsCtx) fillCollectedStats(data *StatsResp, units []*unitDB, curID uint32) {
-	size := len(units)
+// fillCollectedStats fills data with collected statistics.  perBucket must
+// contain the per-bucket result counters of the whole requested range,
+// ordered from the oldest bucket to the current one.
+func (s *StatsCtx) fillCollectedStats(data *StatsResp, perBucket [][resultLast]uint64, curID uint32) {
+	size := len(perBucket)
 	data.TimeUnits = timeUnitsHours
 
 	daysCount := size / 24
@@ -496,44 +450,55 @@ func (s *StatsCtx) fillCollectedStats(data *StatsResp, units []*unitDB, curID ui
 	data.ReplacedParental = make([]uint64, size)
 
 	if data.TimeUnits == timeUnitsDays {
-		s.fillCollectedStatsDaily(data, units, curID, size)
+		s.fillCollectedStatsDaily(data, perBucket, curID, size)
 
 		return
 	}
 
-	for i, u := range units {
-		data.DNSQueries[i] += u.NTotal
-		data.BlockedFiltering[i] += u.NResult[RFiltered]
-		data.ReplacedSafebrowsing[i] += u.NResult[RSafeBrowsing]
-		data.ReplacedParental[i] += u.NResult[RParental]
+	for i, nResult := range perBucket {
+		data.DNSQueries[i] += sumResults(nResult[:])
+		data.BlockedFiltering[i] += nResult[RFiltered]
+		data.ReplacedSafebrowsing[i] += nResult[RSafeBrowsing]
+		data.ReplacedParental[i] += nResult[RParental]
 	}
 }
 
-// fillCollectedStatsDaily fills data with collected daily statistics.  units
-// must contain data for the count of days.
+// fillCollectedStatsDaily fills data with collected daily statistics.
+// perBucket must contain the per-bucket result counters of the whole requested
+// range, ordered from the oldest bucket to the current one.
 //
 // TODO(s.chzhen):  Improve collection of statistics for frontend.  Dashboard
 // cards should contain statistics for the whole interval without rounding to
 // days.
 func (s *StatsCtx) fillCollectedStatsDaily(
 	data *StatsResp,
-	units []*unitDB,
+	perBucket [][resultLast]uint64,
 	curHour uint32,
 	days int,
 ) {
 	// Per time unit counters: 720 hours may span 31 days, so we skip data for
 	// the first hours in this case.  align_ceil(24)
 	hours := countHours(curHour, days)
-	units = units[len(units)-hours:]
+	perBucket = perBucket[len(perBucket)-hours:]
 
-	for i, u := range units {
+	for i, nResult := range perBucket {
 		day := i / 24
 
-		data.DNSQueries[day] += u.NTotal
-		data.BlockedFiltering[day] += u.NResult[RFiltered]
-		data.ReplacedSafebrowsing[day] += u.NResult[RSafeBrowsing]
-		data.ReplacedParental[day] += u.NResult[RParental]
+		data.DNSQueries[day] += sumResults(nResult[:])
+		data.BlockedFiltering[day] += nResult[RFiltered]
+		data.ReplacedSafebrowsing[day] += nResult[RSafeBrowsing]
+		data.ReplacedParental[day] += nResult[RParental]
 	}
+}
+
+// sumResults returns the sum of the per-result counters, which is the total
+// number of requests of a bucket.
+func sumResults(nResult []uint64) (sum uint64) {
+	for _, count := range nResult {
+		sum += count
+	}
+
+	return sum
 }
 
 // countHours returns the number of hours in the last days.

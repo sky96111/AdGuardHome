@@ -72,7 +72,7 @@ func initDNS(
 	}
 
 	statsConf.Ignored = engine
-	globalContext.stats, err = stats.New(statsConf)
+	globalContext.stats, err = stats.New(ctx, statsConf)
 	if err != nil {
 		return fmt.Errorf("init stats: %w", err)
 	}

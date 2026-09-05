@@ -1,6 +1,7 @@
 package stats_test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -68,7 +69,7 @@ func TestStats(t *testing.T) {
 		},
 	}
 
-	s, err := stats.New(conf)
+	s, err := stats.New(context.Background(), conf)
 	require.NoError(t, err)
 
 	s.Start()
@@ -191,7 +192,7 @@ func TestLargeNumbers(t *testing.T) {
 		},
 	}
 
-	s, err := stats.New(conf)
+	s, err := stats.New(context.Background(), conf)
 	require.NoError(t, err)
 
 	s.Start()
@@ -233,7 +234,7 @@ func TestShouldCount(t *testing.T) {
 	engine, err := aghnet.NewIgnoreEngine(ignored, true)
 	require.NoError(t, err)
 
-	s, err := stats.New(stats.Config{
+	s, err := stats.New(context.Background(), stats.Config{
 		Logger:   slogutil.NewDiscardLogger(),
 		Enabled:  true,
 		Filename: filepath.Join(t.TempDir(), "stats.db"),

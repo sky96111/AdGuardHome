@@ -80,7 +80,7 @@ func (s *StatsCtx) handleStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, ok := s.getData(uint32(limit.Hours()))
+	resp, ok := s.getData(ctx, uint32(limit.Hours()))
 
 	l.DebugContext(ctx, "prepared data", "elapsed", time.Since(start))
 

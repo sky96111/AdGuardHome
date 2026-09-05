@@ -2,6 +2,7 @@ package stats
 
 import (
 	"cmp"
+	"context"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -38,7 +39,7 @@ func newTestStatsCtx(tb testing.TB, c Config) (s *StatsCtx) {
 	}
 
 	var err error
-	s, err = New(c)
+	s, err = New(context.TODO(), c)
 	require.NoError(tb, err)
 
 	return s
@@ -76,7 +77,7 @@ func TestStats_races(t *testing.T) {
 
 		<-waitCh
 
-		_, _ = s.getData(24)
+		_, _ = s.getData(context.TODO(), 24)
 	}
 
 	const (
@@ -131,11 +132,11 @@ func TestStatsCtx_FillCollectedStats_daily(t *testing.T) {
 
 	total := make([]uint64, daysCount)
 
-	dailyData := []*unitDB{}
+	perBucket := make([][resultLast]uint64, 0, daysCount*24)
 
 	for i := range daysCount * 24 {
 		n := uint64(i)
-		nResult := make([]uint64, resultLast)
+		nResult := [resultLast]uint64{}
 		nResult[RFiltered] = n
 		nResult[RSafeBrowsing] = n
 		nResult[RParental] = n
@@ -149,10 +150,7 @@ func TestStatsCtx_FillCollectedStats_daily(t *testing.T) {
 
 		total[day] += t
 
-		dailyData = append(dailyData, &unitDB{
-			NTotal:  t,
-			NResult: nResult,
-		})
+		perBucket = append(perBucket, nResult)
 	}
 
 	data := &StatsResp{}
@@ -160,7 +158,7 @@ func TestStatsCtx_FillCollectedStats_daily(t *testing.T) {
 	// In this way we will not skip first hours.
 	curID := uint32(daysCount * 24)
 
-	s.fillCollectedStats(data, dailyData, curID)
+	s.fillCollectedStats(data, perBucket, curID)
 
 	assert.Equal(t, timeUnits, data.TimeUnits)
 	assert.Equal(t, sum[RFiltered], data.BlockedFiltering)
@@ -169,22 +167,41 @@ func TestStatsCtx_FillCollectedStats_daily(t *testing.T) {
 	assert.Equal(t, total, data.DNSQueries)
 }
 
-func TestStatsCtx_DataFromUnits_month(t *testing.T) {
+// TestStatsCtx_getData_month checks that the statistics of a whole month of
+// persisted buckets are loaded and aggregated properly.
+func TestStatsCtx_getData_month(t *testing.T) {
 	const hoursInMonth = 720
 
 	s := newTestStatsCtx(t, Config{
-		Limit:   time.Hour,
+		Limit:   timeutil.Day * 30,
 		Enabled: true,
 	})
 
 	testutil.CleanupAndRequireSuccess(t, s.Close)
 
-	units, curID := s.loadUnits(hoursInMonth)
-	require.Len(t, units, hoursInMonth)
+	st := s.store.Load()
+	require.NotNil(t, st)
 
-	var h uint32
-	for h = 1; h <= hoursInMonth; h++ {
-		data := s.dataFromUnits(units[:h], curID)
-		require.NotNil(t, data)
+	ctx := context.Background()
+	curID := newUnitID()
+
+	// Persist a bucket for every hour of the month but the current one.
+	for i := range hoursInMonth {
+		id := curID - uint32(hoursInMonth) + uint32(i)
+		udb := &unitDB{
+			NResult:   []uint64{0, 1, 0, 0, 0, 0},
+			NTotal:    1,
+			TimeSumUs: 1000,
+		}
+
+		require.NoError(t, st.persistUnit(ctx, id, udb, true))
 	}
+
+	data, ok := s.getData(ctx, hoursInMonth)
+	require.True(t, ok)
+	require.NotNil(t, data)
+
+	assert.Equal(t, timeUnitsDays, data.TimeUnits)
+	assert.Equal(t, uint64(hoursInMonth-1), data.NumDNSQueries)
+	assert.Len(t, data.DNSQueries, hoursInMonth/24)
 }

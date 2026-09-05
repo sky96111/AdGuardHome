@@ -31,7 +31,7 @@ func TestUnit_Deserialize(t *testing.T) {
 			BlockedDomains:     []countPair{},
 			Clients:            []countPair{},
 			NTotal:             0,
-			TimeAvg:            0,
+			TimeSumUs:          0,
 			UpstreamsResponses: []countPair{},
 			UpstreamsTimeSum:   []countPair{},
 		},
@@ -69,8 +69,8 @@ func TestUnit_Deserialize(t *testing.T) {
 			Clients: []countPair{{
 				"127.0.0.1", 2,
 			}},
-			NTotal:  2,
-			TimeAvg: 123456,
+			NTotal:    2,
+			TimeSumUs: 246912,
 			UpstreamsResponses: []countPair{{
 				"1.2.3.4", 2,
 			}},
@@ -103,7 +103,7 @@ func TestTopUpstreamsPairs(t *testing.T) {
 			BlockedDomains:     []countPair{},
 			Clients:            []countPair{},
 			NTotal:             0,
-			TimeAvg:            0,
+			TimeSumUs:          0,
 			UpstreamsResponses: []countPair{},
 			UpstreamsTimeSum:   []countPair{},
 		},
@@ -117,7 +117,7 @@ func TestTopUpstreamsPairs(t *testing.T) {
 			BlockedDomains: []countPair{},
 			Clients:        []countPair{},
 			NTotal:         0,
-			TimeAvg:        0,
+			TimeSumUs:      0,
 			UpstreamsResponses: []countPair{{
 				"1.2.3.4", 2,
 			}},
@@ -139,7 +139,7 @@ func TestTopUpstreamsPairs(t *testing.T) {
 			BlockedDomains: []countPair{},
 			Clients:        []countPair{},
 			NTotal:         0,
-			TimeAvg:        0,
+			TimeSumUs:      0,
 			UpstreamsResponses: []countPair{
 				{"3.3.3.3", 8},
 				{"2.2.2.2", 4},

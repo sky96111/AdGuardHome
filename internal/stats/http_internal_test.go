@@ -2,6 +2,7 @@ package stats
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -142,15 +143,13 @@ func populateTestData(tb testing.TB, s *StatsCtx) {
 		Domains: []countPair{{Name: TestDomain1, Count: 1}},
 		NTotal:  1,
 	}
+	// The total number of requests is the sum of the per-result counters.
+	oldUnit.NResult[RNotFiltered] = 1
 
-	db := s.db.Load()
-	tx, err := db.Begin(true)
-	require.NoError(tb, err)
+	st := s.store.Load()
+	require.NotNil(tb, st)
 
-	err = s.flushUnitToDB(oldUnit, tx, uint32(oldUnitID))
-	require.NoError(tb, err)
-
-	err = finishTxn(tx, true)
+	err := st.persistUnit(context.TODO(), uint32(oldUnitID), oldUnit, true)
 	require.NoError(tb, err)
 
 	s.Update(&Entry{

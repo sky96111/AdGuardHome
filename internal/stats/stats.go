@@ -16,13 +16,19 @@ import (
 	"github.com/AdguardTeam/AdGuardHome/internal/agh"
 	"github.com/AdguardTeam/AdGuardHome/internal/aghhttp"
 	"github.com/AdguardTeam/AdGuardHome/internal/aghnet"
-	"github.com/AdguardTeam/AdGuardHome/internal/aghos"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/golibs/timeutil"
-	"go.etcd.io/bbolt"
-	bbolterrors "go.etcd.io/bbolt/errors"
 )
+
+// flushCheckIvl is the period of time between checking the need for flushing
+// the current unit to the database.
+const flushCheckIvl = time.Minute
+
+// snapshotIvl is the period of time between refreshing the persisted snapshot
+// of the current unit, so that a crash loses at most this much of the
+// statistics.
+const snapshotIvl = 5 * flushCheckIvl
 
 // checkInterval returns true if days is valid to be used as statistics
 // retention interval.  The valid values are 0, 1, 7, 30 and 90.
@@ -72,9 +78,6 @@ type Config struct {
 	Ignored *aghnet.IgnoreEngine
 
 	// Filename is the name of the database file.
-	//
-	// TODO(f.setrakov): Move the work with DB into a separate entity with
-	// interface.
 	Filename string
 
 	// Limit is an upper limit for collecting statistics.
@@ -105,8 +108,9 @@ type Interface interface {
 	ShouldCount(host string, qType, qClass uint16, ids []string) bool
 }
 
-// StatsCtx collects the statistics and flushes it to the database.  Its default
-// flushing interval is one hour.
+// StatsCtx collects the statistics and flushes it to the database.  The
+// statistics are pre-aggregated in memory per hour unit and stored in an
+// SQLite database, see [store].
 type StatsCtx struct {
 	// logger is used for logging the operation of the statistics management.
 	// It must not be nil.
@@ -117,8 +121,8 @@ type StatsCtx struct {
 	// curr is the actual statistics collection result.
 	curr *unit
 
-	// db is the opened statistics database, if any.
-	db atomic.Pointer[bbolt.DB]
+	// store is the opened statistics database, if any.
+	store atomic.Pointer[store]
 
 	// unitIDGen is the function that generates an identifier for the current
 	// unit.  It's here for only testing purposes.
@@ -148,11 +152,15 @@ type StatsCtx struct {
 
 	// enabled tells if the statistics are enabled.
 	enabled bool
+
+	// lastSnapshot is the time of the last durability snapshot of the current
+	// unit.  It's only used by the flushing goroutine while holding currMu.
+	lastSnapshot time.Time
 }
 
 // New creates s from conf and properly initializes it.  Don't use s before
 // calling it's Start method.
-func New(conf Config) (s *StatsCtx, err error) {
+func New(ctx context.Context, conf Config) (s *StatsCtx, err error) {
 	defer withRecovered(&err)
 
 	err = validateIvl(conf.Limit)
@@ -182,31 +190,37 @@ func New(conf Config) (s *StatsCtx, err error) {
 		s.unitIDGen = conf.UnitID
 	}
 
-	// TODO(e.burkov):  Move the code below to the Start method.
-
-	err = s.openDB()
+	st, err := newStore(ctx, s.logger, s.filename)
 	if err != nil {
 		return nil, fmt.Errorf("opening database: %w", err)
 	}
 
-	var udb *unitDB
+	s.store.Store(st)
+
 	id := s.unitIDGen()
+	if s.limit == 0 {
+		s.curr = newUnit(id)
 
-	tx, err := s.db.Load().Begin(true)
-	if err != nil {
-		return nil, fmt.Errorf("opening a transaction: %w", err)
+		return s, nil
 	}
 
-	deleted := s.deleteOldUnits(tx, id-uint32(s.limit.Hours())-1)
-	udb = s.loadUnitFromDB(tx, id)
-
-	err = finishTxn(tx, deleted > 0)
+	err = st.deleteBucketsBefore(ctx, id-uint32(s.limit.Hours())+1)
 	if err != nil {
-		s.logger.Error("finishing transacation", slogutil.KeyError, err)
+		s.logger.Error("deleting old units", slogutil.KeyError, err)
 	}
 
-	s.curr = newUnit(id)
-	s.curr.deserialize(udb)
+	// Restore the current unit, if any, to continue collecting into it.
+	udb, err := st.loadUnit(ctx, id)
+	if err != nil {
+		s.logger.Error("loading current unit", slogutil.KeyError, err)
+	} else {
+		s.curr = newUnit(id)
+		s.curr.deserialize(udb)
+	}
+
+	if s.curr == nil {
+		s.curr = newUnit(id)
+	}
 
 	s.logger.Debug("initialized")
 
@@ -242,14 +256,16 @@ func (s *StatsCtx) Start() {
 	go s.periodicFlush()
 }
 
-// Close implements the [io.Closer] interface for *StatsCtx.
+// Close implements the [io.Closer] interface for *StatsCtx.  It flushes the
+// current unit to the database and closes the database.
 func (s *StatsCtx) Close() (err error) {
-	db := s.db.Swap(nil)
-	if db == nil {
+	st := s.store.Swap(nil)
+	if st == nil {
 		return nil
 	}
+
 	defer func() {
-		cerr := db.Close()
+		cerr := st.Close(context.TODO())
 		if cerr == nil {
 			s.logger.Debug("database closed")
 		}
@@ -257,20 +273,39 @@ func (s *StatsCtx) Close() (err error) {
 		err = errors.WithDeferred(err, cerr)
 	}()
 
-	// NOTE:  This mutex, when combined with the database transaction, is
-	// required to be locked first.
-	s.currMu.RLock()
-	defer s.currMu.RUnlock()
+	s.currMu.Lock()
+	defer s.currMu.Unlock()
+
+	if s.curr == nil {
+		return nil
+	}
 
 	udb := s.curr.serialize()
-
-	tx, err := db.Begin(true)
-	if err != nil {
-		return fmt.Errorf("opening transaction: %w", err)
+	if udb.NTotal == 0 {
+		return nil
 	}
-	defer func() { err = errors.WithDeferred(err, finishTxn(tx, err == nil)) }()
 
-	return s.flushUnitToDB(udb, tx, s.curr.id)
+	// TODO(s.chzhen):  Pass context.
+	//
+	// The current unit's bucket isn't a part of the aggregated top counters,
+	// which cover only the completed hours.
+	return s.persistUnit(context.TODO(), st, s.curr.id, udb, false)
+}
+
+// persistUnit stores udb as the bucket id.
+func (s *StatsCtx) persistUnit(
+	ctx context.Context,
+	st *store,
+	id uint32,
+	udb *unitDB,
+	updateTops bool,
+) (err error) {
+	err = st.persistUnit(ctx, id, udb, updateTops)
+	if err != nil {
+		return fmt.Errorf("persisting unit %d: %w", id, err)
+	}
+
+	return nil
 }
 
 // Update implements the [Interface] interface for *StatsCtx.  e must not be
@@ -322,17 +357,37 @@ func (s *StatsCtx) TopClientsIP(maxCount uint) (ips []netip.Addr) {
 		return nil
 	}
 
-	units, _ := s.loadUnits(limit)
-	if units == nil {
+	s.currMu.RLock()
+	cur := s.curr
+	if cur == nil {
+		s.currMu.RUnlock()
+
+		return nil
+	}
+	curSnap := cur.serialize()
+	s.currMu.RUnlock()
+
+	st := s.store.Load()
+	if st == nil {
 		return nil
 	}
 
-	// Collect data for all the clients to sort and crop it afterwards.
-	m := map[string]uint64{}
-	for _, u := range units {
-		for _, it := range u.Clients {
-			m[it.Name] += it.Count
-		}
+	// TODO(s.chzhen):  Pass context.
+	ctx := context.TODO()
+
+	// The database part of the top list is exact, since any client beyond it
+	// can't enter the final top list without also being in the current
+	// unit's data, which is merged below.
+	dbClients, err := st.loadTopClients(ctx, int(maxCount))
+	if err != nil {
+		s.logger.Error("loading top clients", slogutil.KeyError, err)
+
+		return nil
+	}
+
+	m := convertSliceToMap(dbClients)
+	for _, c := range curSnap.Clients {
+		m[c.Name] += c.Count
 	}
 
 	a := convertMapToSlice(m, int(maxCount))
@@ -347,81 +402,21 @@ func (s *StatsCtx) TopClientsIP(maxCount uint) (ips []netip.Addr) {
 	return ips
 }
 
-// deleteOldUnits walks the buckets available to tx and deletes old units.  It
-// returns the number of deletions performed.
-func (s *StatsCtx) deleteOldUnits(tx *bbolt.Tx, firstID uint32) (deleted int) {
-	s.logger.Debug("deleting old units up to", "unit", firstID)
-
-	// TODO(a.garipov): See if this is actually necessary.  Looks like a rather
-	// bizarre solution.
-	const errStop errors.Error = "stop iteration"
-
-	walk := func(name []byte, _ *bbolt.Bucket) (err error) {
-		nameID, ok := unitNameToID(name)
-		if ok && nameID >= firstID {
-			return errStop
-		}
-
-		err = tx.DeleteBucket(name)
-		if err != nil {
-			s.logger.Debug("deleting bucket", slogutil.KeyError, err)
-
-			return nil
-		}
-
-		s.logger.Debug("deleted unit", "name_id", nameID, "name", fmt.Sprintf("%x", name))
-
-		deleted++
-
-		return nil
-	}
-
-	err := tx.ForEach(walk)
-	if err != nil && !errors.Is(err, errStop) {
-		s.logger.Debug("deleting units", slogutil.KeyError, err)
-	}
-
-	return deleted
-}
-
-// openDB returns an error if the database can't be opened from the specified
-// file.  It's safe for concurrent use.
-func (s *StatsCtx) openDB() (err error) {
-	s.logger.Debug("opening database")
-
-	var db *bbolt.DB
-
-	db, err = bbolt.Open(s.filename, aghos.DefaultPermFile, nil)
-	if err != nil {
-		if err.Error() == "invalid argument" {
-			const lines = `AdGuard Home cannot be initialized due to an incompatible file system.
-Please read the explanation here: https://github.com/AdguardTeam/AdGuardHome/wiki/Getting-Started#limitations`
-
-			// TODO(s.chzhen):  Use passed context.
-			slogutil.PrintLines(
-				context.TODO(),
-				s.logger,
-				slog.LevelError,
-				"opening database",
-				lines,
-			)
-		}
-
-		return err
-	}
-
-	defer s.logger.Debug("database opened")
-
-	s.db.Store(db)
-
-	return nil
-}
-
-func (s *StatsCtx) flush() (cont bool, sleepFor time.Duration) {
+// flushTick flushes the statistics to the database, if needed.  When the
+// current unit's hour has passed, the unit is persisted and replaced with an
+// empty one for the new hour; otherwise, the persisted snapshot of the current
+// unit is periodically refreshed to reduce the amount of statistics lost in
+// case of a crash.  confMu and currMu are expected to be locked by this
+// method.
+func (s *StatsCtx) flushTick(now time.Time) {
 	id := s.unitIDGen()
 
 	s.confMu.Lock()
 	defer s.confMu.Unlock()
+
+	if !s.enabled || s.limit == 0 {
+		return
+	}
 
 	// NOTE:  This mutex, when combined with the database transaction, is
 	// required to be locked first.
@@ -430,75 +425,77 @@ func (s *StatsCtx) flush() (cont bool, sleepFor time.Duration) {
 
 	ptr := s.curr
 	if ptr == nil {
-		return false, 0
+		return
 	}
 
 	limit := uint32(s.limit.Hours())
-	if limit == 0 || ptr.id == id {
-		return true, time.Second
+	if limit == 0 {
+		return
 	}
 
-	return s.flushDB(id, limit, ptr)
-}
-
-// flushDB flushes the unit to the database.  confMu and currMu are expected to
-// be locked.
-func (s *StatsCtx) flushDB(id, limit uint32, ptr *unit) (cont bool, sleepFor time.Duration) {
-	db := s.db.Load()
-	if db == nil {
-		return true, 0
+	st := s.store.Load()
+	if st == nil {
+		return
 	}
 
-	isCommitable := true
-	tx, err := db.Begin(true)
-	if err != nil {
-		s.logger.Error("opening transaction", slogutil.KeyError, err)
+	// TODO(s.chzhen):  Pass context.
+	ctx := context.TODO()
 
-		return true, 0
-	}
-	defer func() {
-		if err = finishTxn(tx, isCommitable); err != nil {
-			s.logger.Error("finishing transaction", slogutil.KeyError, err)
+	if ptr.id != id {
+		// The current unit's hour has passed: persist it and start a new
+		// empty unit.  The unit is complete now, so it becomes a part of the
+		// aggregated top counters.
+		udb := ptr.serialize()
+
+		flushErr := s.persistUnit(ctx, st, ptr.id, udb, true)
+		if flushErr != nil {
+			s.logger.Error("flushing unit", slogutil.KeyError, flushErr)
 		}
-	}()
 
-	s.curr = newUnit(id)
+		s.curr = newUnit(id)
 
+		delErr := st.deleteBucketsBefore(ctx, id-limit+1)
+		if delErr != nil {
+			s.logger.Error("deleting old buckets", slogutil.KeyError, delErr)
+		}
+
+		s.lastSnapshot = now
+
+		return
+	}
+
+	if now.Sub(s.lastSnapshot) < snapshotIvl {
+		return
+	}
+
+	s.lastSnapshot = now
+
+	// Refresh the persisted snapshot of the current unit.  The top counters
+	// aren't updated, since they cover only the completed hours.
 	udb := ptr.serialize()
-	flushErr := s.flushUnitToDB(udb, tx, ptr.id)
+	if udb.NTotal == 0 {
+		return
+	}
+
+	flushErr := s.persistUnit(ctx, st, ptr.id, udb, false)
 	if flushErr != nil {
 		s.logger.Error("flushing unit", slogutil.KeyError, flushErr)
-		isCommitable = false
 	}
-
-	delErr := tx.DeleteBucket(idToUnitName(id - limit))
-
-	if delErr != nil {
-		// TODO(e.burkov):  Improve the algorithm of deleting the oldest bucket
-		// to avoid the error.
-		lvl := slog.LevelDebug
-		if !errors.Is(delErr, bbolterrors.ErrBucketNotFound) {
-			isCommitable = false
-			lvl = slog.LevelError
-		}
-
-		s.logger.Log(context.TODO(), lvl, "deleting bucket", slogutil.KeyError, delErr)
-	}
-
-	return true, 0
 }
 
-// periodicFlush checks and flushes the unit to the database if the freshly
-// generated unit ID differs from the current's ID.  Flushing process includes:
-//   - swapping the current unit with the new empty one;
-//   - writing the current unit to the database;
-//   - removing the stale unit from the database.
+// periodicFlush periodically checks the need for flushing the unit to the
+// database.  Flushing process includes:
+//   - persisting the current unit once its hour has passed, replacing it with
+//     a new empty one;
+//   - removing the stale units from the database;
+//   - refreshing the persisted snapshot of the current unit.
 func (s *StatsCtx) periodicFlush() {
-	for cont, sleepFor := true, time.Duration(0); cont; time.Sleep(sleepFor) {
-		cont, sleepFor = s.flush()
-	}
+	ticker := time.NewTicker(flushCheckIvl)
+	defer ticker.Stop()
 
-	s.logger.Debug("periodic flushing finished")
+	for now := range ticker.C {
+		s.flushTick(now)
+	}
 }
 
 // setLimit sets the limit.  s.lock is expected to be locked.
@@ -525,103 +522,167 @@ func (s *StatsCtx) setLimit(limit time.Duration) {
 func (s *StatsCtx) clear() (err error) {
 	defer func() { err = errors.Annotate(err, "clearing: %w") }()
 
-	db := s.db.Swap(nil)
-	if db != nil {
-		var tx *bbolt.Tx
-		tx, err = db.Begin(true)
-		if err != nil {
-			s.logger.Error("opening transaction", slogutil.KeyError, err)
-		} else if err = finishTxn(tx, false); err != nil {
-			// Don't wrap the error since it's informative enough as is.
-			return err
-		}
-
-		// Active transactions will continue using database, but new ones won't
-		// be created.
-		err = db.Close()
-		if err != nil {
-			return fmt.Errorf("closing database: %w", err)
-		}
-
-		// All active transactions are now closed.
-		s.logger.Debug("database closed")
-	}
-
-	err = os.Remove(s.filename)
-	if err != nil {
-		s.logger.Error("removing", slogutil.KeyError, err)
-	}
-
-	err = s.openDB()
-	if err != nil {
-		s.logger.Error("opening database", slogutil.KeyError, err)
-	}
-
-	// Use defer to unlock the mutex as soon as possible.
-	defer s.logger.Debug("cleared")
-
 	s.currMu.Lock()
 	defer s.currMu.Unlock()
 
+	// Close and remove the database file to guarantee the clean state, then
+	// open a fresh one.
+	if st := s.store.Swap(nil); st != nil {
+		err = st.Close(context.TODO())
+		if err != nil {
+			s.logger.Error("closing database", slogutil.KeyError, err)
+		}
+	}
+
+	for _, p := range []string{s.filename, s.filename + "-wal", s.filename + "-shm"} {
+		rmErr := os.Remove(p)
+		if rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			s.logger.Error("removing", "file", p, slogutil.KeyError, rmErr)
+		}
+	}
+
+	// TODO(s.chzhen):  Pass context.
+	st, openErr := newStore(context.TODO(), s.logger, s.filename)
+	if openErr != nil {
+		s.logger.Error("opening database", slogutil.KeyError, openErr)
+
+		return openErr
+	}
+
+	s.store.Store(st)
+
 	s.curr = newUnit(s.unitIDGen())
+	s.lastSnapshot = time.Time{}
+
+	s.logger.Debug("cleared")
 
 	return nil
 }
 
-// loadUnits returns stored units from the database and current unit ID.
-func (s *StatsCtx) loadUnits(limit uint32) (units []*unitDB, curID uint32) {
-	db := s.db.Load()
-	if db == nil {
-		return nil, 0
-	}
-
-	// NOTE:  This mutex, when combined with the database transaction, is
-	// required to be locked first.
+// loadUnitSnapshot returns a serialized snapshot of the current unit along
+// with its ID, if any.
+func (s *StatsCtx) loadUnitSnapshot() (udb *unitDB, curID uint32) {
 	s.currMu.RLock()
 	defer s.currMu.RUnlock()
 
-	// Use writable transaction to ensure any ongoing writable transaction is
-	// taken into account.
-	tx, err := db.Begin(true)
-	if err != nil {
-		s.logger.Error("opening transaction", slogutil.KeyError, err)
-
+	cur := s.curr
+	if cur == nil {
 		return nil, 0
 	}
-	cur := s.curr
 
-	if cur != nil {
-		curID = cur.id
-	} else {
-		curID = s.unitIDGen()
+	return cur.serialize(), cur.id
+}
+
+// loadAggregates loads the statistics of the buckets in the [firstID, curID)
+// range from the database and returns them along with curSnap, the snapshot
+// of the current unit, which isn't a part of the database data.  When windowed
+// is false, the top lists are loaded from the aggregated top counters, which
+// cover exactly the completed hours of the retention window; otherwise they
+// are aggregated from the per-bucket rows of the requested range.
+func (s *StatsCtx) loadAggregates(
+	ctx context.Context,
+	firstID, curID uint32,
+	windowed bool,
+) (dbAgg *unitDB, perBucket map[uint32][]uint64, timeSumUs uint64, err error) {
+	st := s.store.Load()
+	if st == nil {
+		return nil, nil, 0, errors.Error("database is closed")
 	}
 
-	// Per-hour units.
-	units = make([]*unitDB, 0, limit)
-	firstID := curID - limit + 1
-	for i := firstID; i != curID; i++ {
-		u := s.loadUnitFromDB(tx, i)
-		if u == nil {
-			u = &unitDB{NResult: make([]uint64, resultLast)}
-		}
-		units = append(units, u)
-	}
-
-	err = finishTxn(tx, false)
+	perBucket, err = st.loadCounters(ctx, firstID, curID)
 	if err != nil {
-		s.logger.Error("finishing transaction", slogutil.KeyError, err)
+		return nil, nil, 0, err
 	}
 
-	if cur != nil {
-		units = append(units, cur.serialize())
+	timeSumUs, err = st.loadTimeSumUs(ctx, firstID, curID)
+	if err != nil {
+		return nil, nil, 0, err
 	}
 
-	if unitsLen := len(units); unitsLen != int(limit) {
-		// Should not happen.
-		panic(fmt.Errorf("loaded %d units when the desired number is %d", unitsLen, limit))
+	dbAgg = &unitDB{}
+
+	if windowed {
+		dbAgg.Domains, err = st.loadTopDomainsWindowed(ctx, firstID, curID, maxDomains, false)
+		if err != nil {
+			return nil, nil, 0, err
+		}
+
+		dbAgg.BlockedDomains, err = st.loadTopDomainsWindowed(ctx, firstID, curID, maxDomains, true)
+		if err != nil {
+			return nil, nil, 0, err
+		}
+
+		dbAgg.Clients, err = st.loadTopClientsWindowed(ctx, firstID, curID, maxClients)
+		if err != nil {
+			return nil, nil, 0, err
+		}
+
+		dbAgg.UpstreamsResponses, dbAgg.UpstreamsTimeSum, err = st.loadTopUpstreamsWindowed(
+			ctx,
+			firstID,
+			curID,
+			maxUpstreams,
+		)
+		if err != nil {
+			return nil, nil, 0, err
+		}
+
+		return dbAgg, perBucket, timeSumUs, nil
 	}
 
-	return units, curID
+	dbAgg.Domains, err = st.loadTopDomains(ctx, maxDomains, false)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+
+	dbAgg.BlockedDomains, err = st.loadTopDomains(ctx, maxDomains, true)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+
+	dbAgg.Clients, err = st.loadTopClients(ctx, maxClients)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+
+	dbAgg.UpstreamsResponses, dbAgg.UpstreamsTimeSum, err = st.loadTopUpstreams(ctx, maxUpstreams)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+
+	return dbAgg, perBucket, timeSumUs, nil
+}
+
+// loadUnits returns the aggregates of the buckets in the
+// [curID - limit + 1, curID) range along with the snapshot of the current
+// unit and its ID.  ok is false if the statistics aren't available.
+func (s *StatsCtx) loadUnits(limit uint32) (dbAgg *unitDB, perBucket map[uint32][]uint64, timeSumUs uint64, curSnap *unitDB, curID uint32, ok bool) {
+	curSnap, curID = s.loadUnitSnapshot()
+	if curSnap == nil {
+		return nil, nil, 0, nil, 0, false
+	}
+
+	s.confMu.RLock()
+	configured := uint32(s.limit.Hours())
+	s.confMu.RUnlock()
+
+	// The aggregated top counters cover exactly the completed hours of the
+	// retention window, so they're only used when the requested window
+	// matches the whole retention.  Otherwise, the custom range requested by
+	// the recent parameter is aggregated from the per-bucket rows.
+	windowed := limit != configured
+
+	// TODO(s.chzhen):  Pass context.
+	ctx := context.TODO()
+
+	dbAgg, perBucket, timeSumUs, err := s.loadAggregates(ctx, curID-limit+1, curID, windowed)
+	if err != nil {
+		s.logger.Error("loading aggregates", slogutil.KeyError, err)
+
+		return nil, nil, 0, nil, 0, false
+	}
+
+	return dbAgg, perBucket, timeSumUs, curSnap, curID, true
 }
 
 // ShouldCount returns true if request for the host should be counted.

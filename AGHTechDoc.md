@@ -1396,6 +1396,18 @@ Response:
 
 ## Statistics
 
+The statistics are pre-aggregated in memory per hour unit and stored in an SQLite database, `stats.db` in the statistics directory (see also the `statistics.dir_path` configuration setting).  The storage uses the pure-Go [ncruces/go-sqlite3](https://github.com/ncruces/go-sqlite3) driver, which requires no CGO, and runs in the WAL journaling mode.  The statistics database file of the previous bbolt-based format isn't compatible; AdGuard Home reports it and refuses to start until that file is deleted manually, which resets the statistics.
+
+Each hour unit is stored as rows in the following tables, where the `bucket` column contains the unit ID, an absolute hour number:
+
+* `stats_counters`: the number of requests grouped by the filtering result.
+* `stats_processing`: the sum of the request processing times, in microseconds.
+* `stats_domains`: the number of requests per domain, with a flag telling whether they have been blocked.  Capped at the top 100 names per unit.
+* `stats_clients`: the number of requests per client.  Capped at the top 100 names per unit.
+* `stats_upstreams`: the number of responses and the processing time sums per upstream.  Capped at the top 100 names per unit.
+
+The `stats_top_*` tables contain the sums of the per-name counters over all the completed hours of the retention window, incrementally maintained on each unit flush, so that the top queries don't need to aggregate the whole time range.
+
 Load (main thread):
 . Load data from the last bucket from DB for the current hour
 
@@ -1403,21 +1415,20 @@ Runtime (DNS worker threads):
 . Update current unit
 
 Runtime (goroutine):
-. Periodically check that current unit should be flushed to file (when the current hour changes)
- . If so, flush it, allocate a new empty unit
+. Every minute, check that the current unit should be flushed to the database (when the current hour changes)
+ . If so, flush it, allocate a new empty unit, and remove the stale buckets
+. Every five minutes, refresh the persisted snapshot of the current unit, so that a crash loses at most five minutes of the statistics
 
 Runtime (HTTP worker threads):
 . To respond to "Get statistics" API request we:
- . load all units from file
- . load current unit
- . process data from all loaded units:
-  . sum up data for "total counters" output values
-  . add value into "per time unit counters" output arrays
-  . aggregate data for "top_" output arrays;  sort in descending order
+ . load the per-hour counters from the database
+ . load the top lists from the aggregated top counters, or aggregate them from the per-bucket rows for a custom time range
+ . merge in the current unit's data
+ . sum up data for "total counters" output values
+ . add value into "per time unit counters" output arrays
 
 Unload (main thread):
-. Flush current unit to file
-
+. Flush current unit to database
 
 ### API: Get statistics data
 
