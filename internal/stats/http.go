@@ -216,10 +216,7 @@ func (s *StatsCtx) handleStatsConfig(w http.ResponseWriter, r *http.Request) {
 
 	defer s.configModifier.Apply(ctx)
 
-	s.confMu.Lock()
-	defer s.confMu.Unlock()
-
-	s.setLimit(limit)
+	s.setLimit(ctx, limit)
 }
 
 // handlePutStatsConfig is the handler for the PUT /control/stats/config/update
@@ -283,7 +280,7 @@ func (s *StatsCtx) handlePutStatsConfig(w http.ResponseWriter, r *http.Request) 
 
 // handleStatsReset is the handler for the POST /control/stats_reset HTTP API.
 func (s *StatsCtx) handleStatsReset(w http.ResponseWriter, r *http.Request) {
-	err := s.clear()
+	err := s.clear(r.Context())
 	if err != nil {
 		aghhttp.ErrorAndLog(
 			r.Context(),

@@ -20,11 +20,14 @@ import (
 // jobject is a JSON object alias.
 type jobject = map[string]any
 
-// entriesToJSON converts query log entries to JSON.
+// entriesToJSON converts query log entries to JSON.  oldestID is the database
+// row ID of the oldest returned entry, which is zero if the entries didn't
+// come from the database.
 func (l *queryLog) entriesToJSON(
 	ctx context.Context,
 	entries []*logEntry,
 	oldest time.Time,
+	oldestID int64,
 	anonFunc aghnet.IPMutFunc,
 ) (res jobject) {
 	data := make([]jobject, 0, len(entries))
@@ -41,6 +44,13 @@ func (l *queryLog) entriesToJSON(
 	}
 	if !oldest.IsZero() {
 		res["oldest"] = oldest.Format(time.RFC3339Nano)
+
+		if oldestID != 0 {
+			// The clients that understand this field use it to continue the
+			// pagination without skipping the entries sharing the oldest
+			// timestamp.  The others fall back to the time-only cursor.
+			res["oldest_id"] = oldestID
+		}
 	}
 
 	return res

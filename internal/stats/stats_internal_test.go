@@ -22,6 +22,9 @@ import (
 // testLogger is the common logger for tests.
 var testLogger = slogutil.NewDiscardLogger()
 
+// testTimeout is the common timeout for the test contexts.
+const testTimeout = 5 * time.Second
+
 // newTestStatsCtx returns StatsCtx initialised with given values.  All empty
 // values from c will be replaced with defaults.
 func newTestStatsCtx(tb testing.TB, c Config) (s *StatsCtx) {
@@ -52,7 +55,7 @@ func TestStats_races(t *testing.T) {
 		Enabled: true,
 	})
 
-	s.Start()
+	s.Start(testutil.ContextWithTimeout(t, testTimeout))
 	startTime := time.Now()
 	testutil.CleanupAndRequireSuccess(t, s.Close)
 

@@ -89,8 +89,8 @@ type Config struct {
 
 // Interface is the statistics interface to be used by other packages.
 type Interface interface {
-	// Start begins the statistics collecting.
-	Start()
+	// Start begins the statistics collecting.  It stops when ctx is canceled.
+	Start(ctx context.Context)
 
 	io.Closer
 
@@ -154,8 +154,13 @@ type StatsCtx struct {
 	enabled bool
 
 	// lastSnapshot is the time of the last durability snapshot of the current
-	// unit.  It's only used by the flushing goroutine while holding currMu.
+	// unit.  It's only used by the flushing goroutine.
 	lastSnapshot time.Time
+
+	// flushWG tracks the in-flight database operations of the flushing
+	// goroutine, so that the closer and the clearer of the database don't
+	// race with them.
+	flushWG sync.WaitGroup
 }
 
 // New creates s from conf and properly initializes it.  Don't use s before
@@ -209,6 +214,14 @@ func New(ctx context.Context, conf Config) (s *StatsCtx, err error) {
 		s.logger.Error("deleting old units", slogutil.KeyError, err)
 	}
 
+	// Recompute the aggregated top counters, adopting whatever the previous
+	// process left in the database, including the durability snapshots of the
+	// past hours.
+	err = st.rebuildTopCounters(ctx, id)
+	if err != nil {
+		s.logger.Error("rebuilding top counters", slogutil.KeyError, err)
+	}
+
 	// Restore the current unit, if any, to continue collecting into it.
 	udb, err := st.loadUnit(ctx, id)
 	if err != nil {
@@ -249,20 +262,27 @@ func withRecovered(orig *error) {
 // type check
 var _ Interface = (*StatsCtx)(nil)
 
-// Start implements the [Interface] interface for *StatsCtx.
-func (s *StatsCtx) Start() {
+// Start implements the [Interface] interface for *StatsCtx.  It stops when
+// ctx is canceled.
+func (s *StatsCtx) Start(ctx context.Context) {
 	s.initWeb()
 
-	go s.periodicFlush()
+	go s.periodicFlush(ctx)
 }
 
 // Close implements the [io.Closer] interface for *StatsCtx.  It flushes the
 // current unit to the database and closes the database.
 func (s *StatsCtx) Close() (err error) {
+	// Swap the store first, so that the in-flight flushing goroutine, which
+	// reloads the store after its next lock, notices the closure.
 	st := s.store.Swap(nil)
 	if st == nil {
 		return nil
 	}
+
+	// Wait for the flushing goroutine to finish its database operations
+	// before closing the database.
+	s.flushWG.Wait()
 
 	defer func() {
 		cerr := st.Close(context.TODO())
@@ -311,10 +331,11 @@ func (s *StatsCtx) persistUnit(
 // Update implements the [Interface] interface for *StatsCtx.  e must not be
 // nil.
 func (s *StatsCtx) Update(e *Entry) {
-	s.confMu.Lock()
-	defer s.confMu.Unlock()
+	s.confMu.RLock()
+	enabled, limit := s.enabled, s.limit
+	s.confMu.RUnlock()
 
-	if !s.enabled || s.limit == 0 {
+	if !enabled || limit == 0 {
 		return
 	}
 
@@ -406,30 +427,27 @@ func (s *StatsCtx) TopClientsIP(maxCount uint) (ips []netip.Addr) {
 // current unit's hour has passed, the unit is persisted and replaced with an
 // empty one for the new hour; otherwise, the persisted snapshot of the current
 // unit is periodically refreshed to reduce the amount of statistics lost in
-// case of a crash.  confMu and currMu are expected to be locked by this
-// method.
-func (s *StatsCtx) flushTick(now time.Time) {
+// case of a crash.  currMu is held only to snapshot and replace the current
+// unit, so the database operations don't delay the DNS request path, whose
+// updates block on currMu.
+func (s *StatsCtx) flushTick(ctx context.Context, now time.Time) {
+	// Track the database operations for the closers and the clearers of the
+	// database.
+	s.flushWG.Add(1)
+	defer s.flushWG.Done()
+
 	id := s.unitIDGen()
 
-	s.confMu.Lock()
-	defer s.confMu.Unlock()
+	s.confMu.RLock()
+	enabled, limit := s.enabled, s.limit
+	s.confMu.RUnlock()
 
-	if !s.enabled || s.limit == 0 {
+	if !enabled || limit == 0 {
 		return
 	}
 
-	// NOTE:  This mutex, when combined with the database transaction, is
-	// required to be locked first.
-	s.currMu.Lock()
-	defer s.currMu.Unlock()
-
-	ptr := s.curr
-	if ptr == nil {
-		return
-	}
-
-	limit := uint32(s.limit.Hours())
-	if limit == 0 {
+	limitHours := uint32(limit.Hours())
+	if limitHours == 0 {
 		return
 	}
 
@@ -438,41 +456,49 @@ func (s *StatsCtx) flushTick(now time.Time) {
 		return
 	}
 
-	// TODO(s.chzhen):  Pass context.
-	ctx := context.TODO()
+	// Snapshot the current unit, replacing it with an empty one on the hour
+	// rollover.  Skip the whole work, if the current unit's hour hasn't
+	// passed and the snapshot isn't due yet.
+	s.currMu.Lock()
+	ptr := s.curr
+	if ptr == nil {
+		s.currMu.Unlock()
 
-	if ptr.id != id {
-		// The current unit's hour has passed: persist it and start a new
-		// empty unit.  The unit is complete now, so it becomes a part of the
-		// aggregated top counters.
-		udb := ptr.serialize()
+		return
+	}
 
+	rollover := ptr.id != id
+	if !rollover && now.Sub(s.lastSnapshot) < snapshotIvl {
+		s.currMu.Unlock()
+
+		return
+	}
+
+	udb := ptr.serialize()
+	if rollover {
+		s.curr = newUnit(id)
+	}
+	s.lastSnapshot = now
+	s.currMu.Unlock()
+
+	if rollover {
+		// The current unit's hour has passed: persist it, making it a part of
+		// the aggregated top counters, and remove the stale buckets.
 		flushErr := s.persistUnit(ctx, st, ptr.id, udb, true)
 		if flushErr != nil {
 			s.logger.Error("flushing unit", slogutil.KeyError, flushErr)
 		}
 
-		s.curr = newUnit(id)
-
-		delErr := st.deleteBucketsBefore(ctx, id-limit+1)
+		delErr := st.deleteBucketsBefore(ctx, id-limitHours+1)
 		if delErr != nil {
 			s.logger.Error("deleting old buckets", slogutil.KeyError, delErr)
 		}
 
-		s.lastSnapshot = now
-
 		return
 	}
-
-	if now.Sub(s.lastSnapshot) < snapshotIvl {
-		return
-	}
-
-	s.lastSnapshot = now
 
 	// Refresh the persisted snapshot of the current unit.  The top counters
 	// aren't updated, since they cover only the completed hours.
-	udb := ptr.serialize()
 	if udb.NTotal == 0 {
 		return
 	}
@@ -489,48 +515,67 @@ func (s *StatsCtx) flushTick(now time.Time) {
 //     a new empty one;
 //   - removing the stale units from the database;
 //   - refreshing the persisted snapshot of the current unit.
-func (s *StatsCtx) periodicFlush() {
+//
+// It returns when ctx is canceled.
+func (s *StatsCtx) periodicFlush(ctx context.Context) {
 	ticker := time.NewTicker(flushCheckIvl)
 	defer ticker.Stop()
 
-	for now := range ticker.C {
-		s.flushTick(now)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			s.flushTick(ctx, now)
+		}
 	}
 }
 
-// setLimit sets the limit.  s.lock is expected to be locked.
+// setLimit sets the limit.  It manages confMu itself, so that the clearing of
+// the disabled statistics doesn't block the updates.
 //
 // TODO(s.chzhen):  Remove it when migration to the new API is over.
-func (s *StatsCtx) setLimit(limit time.Duration) {
+func (s *StatsCtx) setLimit(ctx context.Context, limit time.Duration) {
+	s.confMu.Lock()
 	if limit != 0 {
 		s.enabled = true
 		s.limit = limit
+		s.confMu.Unlock()
+
 		s.logger.Debug("setting limit in days", "num", limit/timeutil.Day)
 
 		return
 	}
 
 	s.enabled = false
+	s.confMu.Unlock()
+
 	s.logger.Debug("disabled")
 
-	if err := s.clear(); err != nil {
+	if err := s.clear(ctx); err != nil {
 		s.logger.Error("clearing", slogutil.KeyError, err)
 	}
 }
 
-// Reset counters and clear database
-func (s *StatsCtx) clear() (err error) {
+// clear resets the counters and removes the database with all the statistics.
+func (s *StatsCtx) clear(ctx context.Context) (err error) {
 	defer func() { err = errors.Annotate(err, "clearing: %w") }()
+
+	// Swap the store first, so that the flushing goroutine, which reloads the
+	// store after its next lock, notices the closure, and wait for its
+	// in-flight database operations.
+	st := s.store.Swap(nil)
+	s.flushWG.Wait()
 
 	s.currMu.Lock()
 	defer s.currMu.Unlock()
 
 	// Close and remove the database file to guarantee the clean state, then
 	// open a fresh one.
-	if st := s.store.Swap(nil); st != nil {
-		err = st.Close(context.TODO())
-		if err != nil {
-			s.logger.Error("closing database", slogutil.KeyError, err)
+	if st != nil {
+		closeErr := st.Close(ctx)
+		if closeErr != nil {
+			s.logger.Error("closing database", slogutil.KeyError, closeErr)
 		}
 	}
 
@@ -541,8 +586,7 @@ func (s *StatsCtx) clear() (err error) {
 		}
 	}
 
-	// TODO(s.chzhen):  Pass context.
-	st, openErr := newStore(context.TODO(), s.logger, s.filename)
+	st, openErr := newStore(ctx, s.logger, s.filename)
 	if openErr != nil {
 		s.logger.Error("opening database", slogutil.KeyError, openErr)
 

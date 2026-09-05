@@ -10,6 +10,12 @@ type searchParams struct {
 	// parameter value.  If not set, disregard it and return any value.
 	olderThan time.Time
 
+	// olderThanID is the database row ID of the last entry of the previous
+	// page, used with olderThan for the keyset pagination.  If zero, the
+	// entries sharing the olderThan timestamp may be skipped at a page
+	// boundary.
+	olderThanID int64
+
 	// searchCriteria is a list of search criteria that we use to get filter
 	// results.
 	searchCriteria []searchCriterion

@@ -88,7 +88,7 @@ func TestQueryLog_Search_findClient(t *testing.T) {
 		olderThan: time.Now().Add(10 * time.Second),
 		limit:     3,
 	}
-	entries, _ := l.search(ctx, sp)
+	entries, _, _ := l.search(ctx, sp)
 	assert.Equal(t, 2, findClientCalls)
 
 	require.Len(t, entries, 3)

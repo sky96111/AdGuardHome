@@ -94,16 +94,17 @@ func (l *queryLog) searchMemory(
 
 // search searches log entries in the database, or in the memory buffer if the
 // query log works in the memory-only mode, using the specified parameters and
-// returns the list of the entries found and the time of the oldest returned
-// entry.  l.confMu is expected to be locked.
+// returns the list of the entries found, the time of the oldest returned
+// entry, and its database row ID, which is zero in the memory-only mode.
+// l.confMu is expected to be locked.
 func (l *queryLog) search(
 	ctx context.Context,
 	params *searchParams,
-) (entries []*logEntry, oldest time.Time) {
+) (entries []*logEntry, oldest time.Time, oldestID int64) {
 	start := time.Now()
 
 	if params.limit == 0 {
-		return []*logEntry{}, time.Time{}
+		return []*logEntry{}, time.Time{}, 0
 	}
 
 	if l.store == nil {
@@ -119,7 +120,7 @@ func (l *queryLog) search(
 			l.logger.ErrorContext(ctx, "flushing buffer before search", slogutil.KeyError, err)
 		}
 
-		entries, oldest = l.searchStore(ctx, params)
+		entries, oldest, oldestID = l.searchStore(ctx, params)
 	}
 
 	l.logger.DebugContext(
@@ -130,7 +131,7 @@ func (l *queryLog) search(
 		"elapsed", time.Since(start),
 	)
 
-	return entries, oldest
+	return entries, oldest, oldestID
 }
 
 // searchStore searches the database using the specified parameters.  The
@@ -138,7 +139,7 @@ func (l *queryLog) search(
 func (l *queryLog) searchStore(
 	ctx context.Context,
 	params *searchParams,
-) (entries []*logEntry, oldest time.Time) {
+) (entries []*logEntry, oldest time.Time, oldestID int64) {
 	term, strict := searchTerm(params)
 	lists := l.clientIDLists(ctx, term, strict)
 
@@ -148,7 +149,7 @@ func (l *queryLog) searchStore(
 	if err != nil {
 		l.logger.ErrorContext(ctx, "searching entries", slogutil.KeyError, err)
 
-		return nil, time.Time{}
+		return nil, time.Time{}, 0
 	}
 
 	cache := clientCache{}
@@ -170,9 +171,10 @@ func (l *queryLog) searchStore(
 
 	if len(entries) > 0 {
 		oldest = entries[len(entries)-1].Time
+		oldestID = entries[len(entries)-1].id
 	}
 
-	return entries, oldest
+	return entries, oldest, oldestID
 }
 
 // finalizeSearchResults sorts entries and applies offset trimming, and updates
@@ -218,14 +220,15 @@ func searchTerm(params *searchParams) (term string, strict bool) {
 	return "", false
 }
 
-// clientIDLists contains the client IDs resolved for a search.
+// clientIDLists contains the client IDs used to push the client-name search
+// criterion and the per-client ignore settings down to the database.
 type clientIDLists struct {
 	// byName contains the IDs of the clients whose names match the free-text
 	// search term of the search, if any.
-	byName []any
+	byName []string
 
 	// ignored contains the IDs of the clients that must not be logged.
-	ignored []any
+	ignored []string
 }
 
 // clientIDLists resolves the client IDs used to push the client-name search
@@ -259,7 +262,7 @@ func nameMatchesTerm(name, term string, strict bool) (ok bool) {
 }
 
 // nonEmptyIDs returns the non-empty identifiers of the client.
-func nonEmptyIDs(c *Client) (ids []any) {
+func nonEmptyIDs(c *Client) (ids []string) {
 	for _, id := range c.IDs {
 		if id != "" {
 			ids = append(ids, id)

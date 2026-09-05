@@ -1406,7 +1406,7 @@ Each hour unit is stored as rows in the following tables, where the `bucket` col
 * `stats_clients`: the number of requests per client.  Capped at the top 100 names per unit.
 * `stats_upstreams`: the number of responses and the processing time sums per upstream.  Capped at the top 100 names per unit.
 
-The `stats_top_*` tables contain the sums of the per-name counters over all the completed hours of the retention window, incrementally maintained on each unit flush, so that the top queries don't need to aggregate the whole time range.
+The `stats_top_*` tables contain the sums of the per-name counters over all the completed hours of the retention window, incrementally maintained on each unit flush, so that the top queries don't need to aggregate the whole time range.  The `stats_top_covered` table tracks the buckets whose data is currently included in the aggregated top counters, since the durability snapshots of the current unit are written without updating them.  On startup, the aggregated top counters are recomputed from the per-bucket rows, which adopts the buckets left by the previous process, including its durability snapshots, so that a crash or a restart can't skew the top lists.
 
 Load (main thread):
 . Load data from the last bucket from DB for the current hour
@@ -1553,7 +1553,7 @@ First, new data is stored in a memory buffer.  When this buffer is filled to a p
 
 When the UI asks for data from query log (see "API: Get query log"), the search parameters are translated into an SQL query, so that all the filtering is performed by the database:
 
-* The `older_than` cursor and the `limit`/`offset` pagination use the index over the `time` column, and the entries are returned from newest to oldest.
+* The `older_than` cursor and the `limit`/`offset` pagination use the index over the `time` column, and the entries are returned from newest to oldest.  The optional `older_than_id` parameter, the row ID of the oldest entry of the previous page returned in the `oldest_id` response field, turns the cursor into the `(time, id)` keyset, so that the entries sharing the cursor's timestamp aren't skipped at a page boundary.  The clients that don't send `older_than_id` fall back to the time-only cursor.
 * The `response_status` and `reason` criteria are translated into predicates over the `reason` and `is_filtered` columns.
 * The free-text `search` criterion is matched against the `host`, `client_ip`, and `client_id` columns.  Exact matches use the indexes over those columns; substring matches of three characters and longer use the FTS index; shorter terms fall back to scanning.  The search term is also matched against the known client names, which is resolved into the list of the matching clients' IDs.
 
@@ -1576,10 +1576,11 @@ Request:
 
 	GET /control/querylog
 	?older_than=2006-01-02T15:04:05.999999999Z07:00
+	&older_than_id=42
 	&search=...
 	&response_status="..."
 
-`older_than` setting is used for paging.  UI uses an empty value for `older_than` on the first request and gets the latest log entries. To get the older entries, UI sets `older_than` to the `oldest` value from the server's response.
+`older_than` setting is used for paging.  UI uses an empty value for `older_than` on the first request and gets the latest log entries. To get the older entries, UI sets `older_than` to the `oldest` value from the server's response, along with `older_than_id` set to the `oldest_id` value from it.  The optional `older_than_id` makes the pagination keep the entries sharing the `older_than` timestamp; omitting it is allowed for compatibility.
 
 If search settings are set, server returns only entries that match the specified request.
 

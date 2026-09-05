@@ -7,15 +7,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net/url"
 	"os"
-	"path/filepath"
-	"runtime"
 
-	"github.com/AdguardTeam/AdGuardHome/internal/aghos"
+	"github.com/AdguardTeam/AdGuardHome/internal/aghsqldb"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/logutil/slogutil"
-	"github.com/ncruces/go-sqlite3/driver"
 )
 
 // storeSchema is the SQL schema of the statistics database.  The bucket column
@@ -88,6 +84,15 @@ CREATE TABLE IF NOT EXISTS stats_top_upstreams (
 
 CREATE INDEX IF NOT EXISTS idx_top_upstreams_responses
 	ON stats_top_upstreams (responses);
+
+-- stats_top_covered contains the IDs of the buckets whose data is currently
+-- included in the aggregated top counters.  The durability snapshots of the
+-- current unit are written without updating the top counters, so the covered
+-- buckets must be tracked to subtract and add only what's actually counted.
+-- See [store.rebuildTopCounters] for the startup-time recovery.
+CREATE TABLE IF NOT EXISTS stats_top_covered (
+	bucket INTEGER NOT NULL PRIMARY KEY
+) WITHOUT ROWID;
 `
 
 // insertCountersSQL inserts a single counter row of a bucket.
@@ -136,6 +141,24 @@ type store struct {
 
 	// filename is the name of the database file.
 	filename string
+
+	// stmts contains the prepared statements of the store.  It must not be
+	// nil after init.
+	stmts *storeStmts
+}
+
+// storeStmts contains the prepared statements used on the hot paths.  They
+// are bound to the transactions through [*sql.Tx.StmtContext].
+type storeStmts struct {
+	insertCounters   *sql.Stmt
+	insertProcessing *sql.Stmt
+	insertDomains    *sql.Stmt
+	insertClients    *sql.Stmt
+	insertUpstreams  *sql.Stmt
+
+	addTopDomains   *sql.Stmt
+	addTopClients   *sql.Stmt
+	addTopUpstreams *sql.Stmt
 }
 
 // newStore opens the SQLite database at filename, creating it if necessary,
@@ -150,17 +173,7 @@ func newStore(ctx context.Context, logger *slog.Logger, filename string) (s *sto
 		return nil, err
 	}
 
-	u := &url.URL{
-		Scheme: "file",
-		Path:   uriPath(filename),
-		RawQuery: "_pragma=busy_timeout(10000)" +
-			"&_pragma=journal_mode(WAL)" +
-			"&_pragma=synchronous(NORMAL)" +
-			"&_pragma=temp_store(MEMORY)" +
-			"&_pragma=auto_vacuum(INCREMENTAL)",
-	}
-
-	db, err := driver.Open(u.String())
+	db, err := aghsqldb.Open(filename)
 	if err != nil {
 		return nil, err
 	}
@@ -176,7 +189,7 @@ func newStore(ctx context.Context, logger *slog.Logger, filename string) (s *sto
 		return nil, errors.WithDeferred(err, s.Close(ctx))
 	}
 
-	err = chmodDBFiles(filename)
+	err = aghsqldb.ChmodFiles(filename)
 	if err != nil {
 		return nil, errors.WithDeferred(err, s.Close(ctx))
 	}
@@ -184,11 +197,46 @@ func newStore(ctx context.Context, logger *slog.Logger, filename string) (s *sto
 	return s, nil
 }
 
-// init creates the schema.
+// init creates the schema and prepares the hot statements.
 func (s *store) init(ctx context.Context) (err error) {
 	_, err = s.db.ExecContext(ctx, storeSchema)
 	if err != nil {
 		return fmt.Errorf("creating schema: %w", err)
+	}
+
+	s.stmts = &storeStmts{}
+	for _, p := range []struct {
+		stmt **sql.Stmt
+		sql  string
+	}{{
+		stmt: &s.stmts.insertCounters,
+		sql:  insertCountersSQL,
+	}, {
+		stmt: &s.stmts.insertProcessing,
+		sql:  insertProcessingSQL,
+	}, {
+		stmt: &s.stmts.insertDomains,
+		sql:  insertDomainsSQL,
+	}, {
+		stmt: &s.stmts.insertClients,
+		sql:  insertClientsSQL,
+	}, {
+		stmt: &s.stmts.insertUpstreams,
+		sql:  insertUpstreamsSQL,
+	}, {
+		stmt: &s.stmts.addTopDomains,
+		sql:  addTopDomainsSQL,
+	}, {
+		stmt: &s.stmts.addTopClients,
+		sql:  addTopClientsSQL,
+	}, {
+		stmt: &s.stmts.addTopUpstreams,
+		sql:  addTopUpstreamsSQL,
+	}} {
+		*p.stmt, err = s.db.PrepareContext(ctx, p.sql)
+		if err != nil {
+			return fmt.Errorf("preparing statement: %w", err)
+		}
 	}
 
 	return nil
@@ -251,38 +299,28 @@ then start AdGuard Home again.
 	return fmt.Errorf("legacy statistics database %q: %w", filename, errLegacyDB)
 }
 
-// uriPath converts the platform-specific file path into the path component of
-// an SQLite URI filename.
-func uriPath(filename string) (p string) {
-	p = filepath.ToSlash(filename)
-	if runtime.GOOS == "windows" && filepath.IsAbs(filename) {
-		// "C:\dir\stats.db" -> "/C:/dir/stats.db", which is the form SQLite
-		// expects in URI filenames.
-		p = "/" + p
-	}
-
-	return p
-}
-
-// chmodDBFiles makes sure the database files are only accessible by the
-// owner, as the statistics contain the client IP addresses.  SQLite creates
-// the files with the mode of 0666 masked by the process umask.
-func chmodDBFiles(filename string) (err error) {
-	defer func() { err = errors.Annotate(err, "setting db file permissions: %w") }()
-
-	for _, p := range []string{filename, filename + "-wal", filename + "-shm"} {
-		err = os.Chmod(p, aghos.DefaultPermFile)
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-	}
-
-	return nil
-}
-
 // Close closes the store.  The store must not be used after that.
 func (s *store) Close(ctx context.Context) (err error) {
 	defer func() { err = errors.Annotate(err, "closing stats db: %w") }()
+
+	if s.stmts != nil {
+		for _, stmt := range []*sql.Stmt{
+			s.stmts.insertCounters,
+			s.stmts.insertProcessing,
+			s.stmts.insertDomains,
+			s.stmts.insertClients,
+			s.stmts.insertUpstreams,
+			s.stmts.addTopDomains,
+			s.stmts.addTopClients,
+			s.stmts.addTopUpstreams,
+		} {
+			if stmt != nil {
+				err = errors.WithDeferred(err, stmt.Close())
+			}
+		}
+
+		s.stmts = nil
+	}
 
 	return errors.WithDeferred(err, s.db.Close())
 }
@@ -307,17 +345,26 @@ func (s *store) persistUnit(ctx context.Context, id uint32, udb *unitDB, updateT
 	}()
 
 	if updateTops {
-		// Each bucket may be written more than once, e.g. by the durability
-		// snapshots of its hour, so the contribution of the previous data of
-		// the bucket must be removed from the aggregated top counters.
-		old, err := loadUnitTx(ctx, tx, id)
+		// The bucket may be written more than once, e.g. by the durability
+		// snapshots of its hour followed by the completion write, but only
+		// the completion writes enter the top counters.  Remove the
+		// contribution of the previous data of the bucket only if it's
+		// actually counted there.
+		covered, err := isTopCovered(ctx, tx, id)
 		if err != nil {
 			return err
 		}
 
-		err = updateTopCounters(ctx, tx, old, -1)
-		if err != nil {
-			return err
+		if covered {
+			old, err := loadUnitTx(ctx, tx, id)
+			if err != nil {
+				return err
+			}
+
+			err = updateTopCounters(ctx, tx, s.stmts, old, -1)
+			if err != nil {
+				return err
+			}
 		}
 	}
 
@@ -326,13 +373,13 @@ func (s *store) persistUnit(ctx context.Context, id uint32, udb *unitDB, updateT
 		return err
 	}
 
-	err = insertBucket(ctx, tx, id, udb)
+	err = insertBucket(ctx, tx, s.stmts, id, udb)
 	if err != nil {
 		return err
 	}
 
 	if updateTops {
-		err = updateTopCounters(ctx, tx, udb, +1)
+		err = updateTopCounters(ctx, tx, s.stmts, udb, +1)
 		if err != nil {
 			return err
 		}
@@ -343,11 +390,109 @@ func (s *store) persistUnit(ctx context.Context, id uint32, udb *unitDB, updateT
 		if err != nil {
 			return err
 		}
+
+		err = markTopCovered(ctx, tx, id)
+		if err != nil {
+			return err
+		}
 	}
 
 	err = tx.Commit()
 	if err != nil {
 		return fmt.Errorf("committing transaction: %w", err)
+	}
+
+	return nil
+}
+
+// rebuildTopCounters recomputes the aggregated top counters and the covered
+// bucket set from the per-bucket rows of all the completed hours, discarding
+// whatever the previous process left there.  It makes the top counters
+// self-healing: the buckets written by the durability snapshots of a previous
+// process are adopted into the top counters, whether or not the previous
+// process counted them, so a crash or a restart can't skew them.
+func (s *store) rebuildTopCounters(ctx context.Context, curID uint32) (err error) {
+	defer func() { err = errors.Annotate(err, "rebuilding top counters: %w") }()
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning transaction: %w", err)
+	}
+
+	defer func() {
+		if err != nil {
+			err = errors.WithDeferred(err, tx.Rollback())
+		}
+	}()
+
+	bucket := int64(curID)
+
+	for _, q := range []struct{ reset, rebuild string }{{
+		reset: `DELETE FROM stats_top_domains`,
+		rebuild: `INSERT INTO stats_top_domains (domain, blocked, count)
+			SELECT domain, blocked, SUM(count) FROM stats_domains
+			WHERE bucket < ? GROUP BY domain, blocked`,
+	}, {
+		reset: `DELETE FROM stats_top_clients`,
+		rebuild: `INSERT INTO stats_top_clients (client, count)
+			SELECT client, SUM(count) FROM stats_clients
+			WHERE bucket < ? GROUP BY client`,
+	}, {
+		reset: `DELETE FROM stats_top_upstreams`,
+		rebuild: `INSERT INTO stats_top_upstreams (upstream, responses, time_sum_us)
+			SELECT upstream, SUM(responses), SUM(time_sum_us) FROM stats_upstreams
+			WHERE bucket < ? GROUP BY upstream`,
+	}, {
+		reset: `DELETE FROM stats_top_covered`,
+		rebuild: `INSERT INTO stats_top_covered (bucket)
+			SELECT DISTINCT bucket FROM stats_counters WHERE bucket < ?`,
+	}} {
+		_, err = tx.ExecContext(ctx, q.reset)
+		if err != nil {
+			return err
+		}
+
+		_, err = tx.ExecContext(ctx, q.rebuild, bucket)
+		if err != nil {
+			return err
+		}
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		return fmt.Errorf("committing transaction: %w", err)
+	}
+
+	return nil
+}
+
+// isTopCovered returns true if the data of the bucket id is currently
+// included in the aggregated top counters.
+func isTopCovered(ctx context.Context, tx *sql.Tx, id uint32) (covered bool, err error) {
+	err = tx.QueryRowContext(
+		ctx,
+		`SELECT EXISTS(SELECT 1 FROM stats_top_covered WHERE bucket = ?)`,
+		int64(id),
+	).Scan(&covered)
+	if err != nil {
+		return false, fmt.Errorf("checking top coverage: %w", err)
+	}
+
+	return covered, nil
+}
+
+// markTopCovered records that the data of the bucket id is included in the
+// aggregated top counters.
+func markTopCovered(ctx context.Context, tx *sql.Tx, id uint32) (err error) {
+	// Ignore the conflict, since the bucket may already be covered, e.g.
+	// after the system clock jumped backwards and its hour reoccurred.
+	_, err = tx.ExecContext(
+		ctx,
+		`INSERT OR IGNORE INTO stats_top_covered (bucket) VALUES (?)`,
+		int64(id),
+	)
+	if err != nil {
+		return fmt.Errorf("marking top coverage: %w", err)
 	}
 
 	return nil
@@ -373,13 +518,18 @@ func (s *store) deleteBucketsBefore(ctx context.Context, firstID uint32) (err er
 
 	bucket := int64(firstID)
 
-	// Collect the contribution of all the removed buckets to subtract it
+	// The covered-bucket condition guards against subtracting the data of
+	// the buckets that were written by the durability snapshots and thus
+	// never entered the top counters.  Normally, all the buckets older than
+	// the retention window are covered.
+	//
+	// Collect the contribution of the covered removed buckets to subtract it
 	// from the aggregated top counters.
 	var old unitDB
-	old.NResult = make([]uint64, resultLast)
 
 	err = queryRows(ctx, tx, `SELECT domain, blocked, SUM(count) FROM stats_domains
-WHERE bucket < ? GROUP BY domain, blocked`, func(rows *sql.Rows) (err error) {
+WHERE bucket < ? AND bucket IN (SELECT bucket FROM stats_top_covered)
+GROUP BY domain, blocked`, func(rows *sql.Rows) (err error) {
 		var name string
 		var blocked bool
 		var count int64
@@ -401,7 +551,8 @@ WHERE bucket < ? GROUP BY domain, blocked`, func(rows *sql.Rows) (err error) {
 	}
 
 	err = queryRows(ctx, tx, `SELECT client, SUM(count) FROM stats_clients
-WHERE bucket < ? GROUP BY client`, func(rows *sql.Rows) (err error) {
+WHERE bucket < ? AND bucket IN (SELECT bucket FROM stats_top_covered)
+GROUP BY client`, func(rows *sql.Rows) (err error) {
 		var name string
 		var count int64
 		err = rows.Scan(&name, &count)
@@ -418,7 +569,8 @@ WHERE bucket < ? GROUP BY client`, func(rows *sql.Rows) (err error) {
 	}
 
 	err = queryRows(ctx, tx, `SELECT upstream, SUM(responses), SUM(time_sum_us) FROM stats_upstreams
-WHERE bucket < ? GROUP BY upstream`, func(rows *sql.Rows) (err error) {
+WHERE bucket < ? AND bucket IN (SELECT bucket FROM stats_top_covered)
+GROUP BY upstream`, func(rows *sql.Rows) (err error) {
 		var name string
 		var respCount, timeSum int64
 		err = rows.Scan(&name, &respCount, &timeSum)
@@ -441,7 +593,7 @@ WHERE bucket < ? GROUP BY upstream`, func(rows *sql.Rows) (err error) {
 		return err
 	}
 
-	err = updateTopCounters(ctx, tx, &old, -1)
+	err = updateTopCounters(ctx, tx, s.stmts, &old, -1)
 	if err != nil {
 		return err
 	}
@@ -457,6 +609,11 @@ WHERE bucket < ? GROUP BY upstream`, func(rows *sql.Rows) (err error) {
 		if err != nil {
 			return fmt.Errorf("clearing %s: %w", table, err)
 		}
+	}
+
+	_, err = tx.ExecContext(ctx, "DELETE FROM stats_top_covered WHERE bucket < ?", bucket)
+	if err != nil {
+		return fmt.Errorf("clearing covered buckets: %w", err)
 	}
 
 	err = removeEmptyTopCounters(ctx, tx)
@@ -495,9 +652,15 @@ func clearBucket(ctx context.Context, tx *sql.Tx, id uint32) (err error) {
 	return nil
 }
 
-// insertBucket inserts the rows of udb for the bucket id.  Zero counters are
-// skipped.
-func insertBucket(ctx context.Context, tx *sql.Tx, id uint32, udb *unitDB) (err error) {
+// insertBucket inserts the rows of udb for the bucket id using the prepared
+// statements of stmts.  Zero counters are skipped.
+func insertBucket(
+	ctx context.Context,
+	tx *sql.Tx,
+	stmts *storeStmts,
+	id uint32,
+	udb *unitDB,
+) (err error) {
 	bucket := int64(id)
 
 	for res, count := range udb.NResult {
@@ -505,25 +668,20 @@ func insertBucket(ctx context.Context, tx *sql.Tx, id uint32, udb *unitDB) (err 
 			continue
 		}
 
-		_, err = tx.ExecContext(ctx, insertCountersSQL, bucket, res, int64(count))
+		_, err = tx.StmtContext(ctx, stmts.insertCounters).ExecContext(ctx, bucket, res, int64(count))
 		if err != nil {
 			return fmt.Errorf("inserting counter: %w", err)
 		}
 	}
 
 	if udb.TimeSumUs != 0 {
-		_, err = tx.ExecContext(ctx, insertProcessingSQL, bucket, int64(udb.TimeSumUs))
+		_, err = tx.StmtContext(ctx, stmts.insertProcessing).ExecContext(ctx, bucket, int64(udb.TimeSumUs))
 		if err != nil {
 			return fmt.Errorf("inserting processing time: %w", err)
 		}
 	}
 
-	insDomains, err := tx.PrepareContext(ctx, insertDomainsSQL)
-	if err != nil {
-		return fmt.Errorf("preparing domains statement: %w", err)
-	}
-	defer func() { err = errors.WithDeferred(err, insDomains.Close()) }()
-
+	insDomains := tx.StmtContext(ctx, stmts.insertDomains)
 	for _, p := range udb.Domains {
 		_, err = insDomains.ExecContext(ctx, bucket, p.Name, false, int64(p.Count))
 		if err != nil {
@@ -538,12 +696,7 @@ func insertBucket(ctx context.Context, tx *sql.Tx, id uint32, udb *unitDB) (err 
 		}
 	}
 
-	insClients, err := tx.PrepareContext(ctx, insertClientsSQL)
-	if err != nil {
-		return fmt.Errorf("preparing clients statement: %w", err)
-	}
-	defer func() { err = errors.WithDeferred(err, insClients.Close()) }()
-
+	insClients := tx.StmtContext(ctx, stmts.insertClients)
 	for _, p := range udb.Clients {
 		_, err = insClients.ExecContext(ctx, bucket, p.Name, int64(p.Count))
 		if err != nil {
@@ -551,11 +704,7 @@ func insertBucket(ctx context.Context, tx *sql.Tx, id uint32, udb *unitDB) (err 
 		}
 	}
 
-	insUpstreams, err := tx.PrepareContext(ctx, insertUpstreamsSQL)
-	if err != nil {
-		return fmt.Errorf("preparing upstreams statement: %w", err)
-	}
-	defer func() { err = errors.WithDeferred(err, insUpstreams.Close()) }()
+	insUpstreams := tx.StmtContext(ctx, stmts.insertUpstreams)
 
 	timeSums := convertSliceToMap(udb.UpstreamsTimeSum)
 	for _, p := range udb.UpstreamsResponses {
@@ -577,17 +726,18 @@ func insertBucket(ctx context.Context, tx *sql.Tx, id uint32, udb *unitDB) (err 
 // updateTopCounters adds the per-name counters of udb to the aggregated top
 // counters, multiplying them by sign, which must be either 1 or -1.  udb may
 // be nil.
-func updateTopCounters(ctx context.Context, tx *sql.Tx, udb *unitDB, sign int) (err error) {
+func updateTopCounters(
+	ctx context.Context,
+	tx *sql.Tx,
+	stmts *storeStmts,
+	udb *unitDB,
+	sign int,
+) (err error) {
 	if udb == nil {
 		return nil
 	}
 
-	insDomains, err := tx.PrepareContext(ctx, addTopDomainsSQL)
-	if err != nil {
-		return fmt.Errorf("preparing top domains statement: %w", err)
-	}
-	defer func() { err = errors.WithDeferred(err, insDomains.Close()) }()
-
+	insDomains := tx.StmtContext(ctx, stmts.addTopDomains)
 	for _, p := range udb.Domains {
 		_, err = insDomains.ExecContext(ctx, p.Name, false, int64(p.Count)*int64(sign))
 		if err != nil {
@@ -602,12 +752,7 @@ func updateTopCounters(ctx context.Context, tx *sql.Tx, udb *unitDB, sign int) (
 		}
 	}
 
-	insClients, err := tx.PrepareContext(ctx, addTopClientsSQL)
-	if err != nil {
-		return fmt.Errorf("preparing top clients statement: %w", err)
-	}
-	defer func() { err = errors.WithDeferred(err, insClients.Close()) }()
-
+	insClients := tx.StmtContext(ctx, stmts.addTopClients)
 	for _, p := range udb.Clients {
 		_, err = insClients.ExecContext(ctx, p.Name, int64(p.Count)*int64(sign))
 		if err != nil {
@@ -615,11 +760,7 @@ func updateTopCounters(ctx context.Context, tx *sql.Tx, udb *unitDB, sign int) (
 		}
 	}
 
-	insUpstreams, err := tx.PrepareContext(ctx, addTopUpstreamsSQL)
-	if err != nil {
-		return fmt.Errorf("preparing top upstreams statement: %w", err)
-	}
-	defer func() { err = errors.WithDeferred(err, insUpstreams.Close()) }()
+	insUpstreams := tx.StmtContext(ctx, stmts.addTopUpstreams)
 
 	timeSums := convertSliceToMap(udb.UpstreamsTimeSum)
 	for _, p := range udb.UpstreamsResponses {
@@ -693,6 +834,10 @@ func loadUnitTx(ctx context.Context, tx *sql.Tx, id uint32) (udb *unitDB, err er
 			err = rows.Scan(&res, &count)
 			if err != nil {
 				return err
+			}
+
+			if res < 0 || res >= int64(resultLast) {
+				return fmt.Errorf("invalid result code %d", res)
 			}
 
 			udb.NResult[res] += uint64(count)
@@ -862,6 +1007,10 @@ func (s *store) loadCounters(
 			err = rows.Scan(&bucketID, &res, &count)
 			if err != nil {
 				return err
+			}
+
+			if res < 0 || res >= int64(resultLast) {
+				return fmt.Errorf("invalid result code %d", res)
 			}
 
 			bucket := uint32(bucketID)

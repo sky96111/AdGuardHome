@@ -94,7 +94,7 @@ func TestHandleStatsConfig(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			s := newTestStatsCtx(t, Config{Enabled: true})
 
-			s.Start()
+			s.Start(testutil.ContextWithTimeout(t, testTimeout))
 			testutil.CleanupAndRequireSuccess(t, s.Close)
 
 			buf, err := json.Marshal(tc.body)
@@ -206,7 +206,7 @@ func TestStatsCtx_handleStats(t *testing.T) {
 		Enabled: true,
 	})
 
-	s.Start()
+	s.Start(testutil.ContextWithTimeout(t, testTimeout))
 	defer testutil.CleanupAndRequireSuccess(t, s.Close)
 
 	populateTestData(t, s)

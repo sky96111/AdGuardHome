@@ -469,7 +469,7 @@ func startDNSServer(ctx context.Context) (err error) {
 	}
 
 	globalContext.filters.Start()
-	globalContext.stats.Start()
+	globalContext.stats.Start(ctx)
 
 	err = globalContext.queryLog.Start(ctx)
 	if err != nil {

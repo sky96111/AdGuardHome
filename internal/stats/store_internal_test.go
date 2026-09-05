@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/AdguardTeam/golibs/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -212,7 +213,7 @@ func TestStatsCtx_FlushTick(t *testing.T) {
 
 	// A flush tick after the snapshot interval refreshes the snapshot of the
 	// current unit.
-	s.flushTick(time.Now().Add(time.Hour))
+	s.flushTick(context.Background(), time.Now().Add(time.Hour))
 
 	st := s.store.Load()
 	require.NotNil(t, st)
@@ -225,7 +226,7 @@ func TestStatsCtx_FlushTick(t *testing.T) {
 	// A flush tick after the hour has passed persists the old unit and
 	// replaces the current one with an empty unit of the new hour.
 	curHour = 101
-	s.flushTick(time.Now().Add(time.Hour))
+	s.flushTick(context.Background(), time.Now().Add(time.Hour))
 
 	udb, err = st.loadUnit(context.Background(), 100)
 	require.NoError(t, err)
@@ -259,4 +260,138 @@ func TestUnit_SerializeCaps(t *testing.T) {
 	assert.Len(t, udb.Clients, maxClients)
 	assert.Equal(t, uint64(200), udb.NTotal)
 	assert.Equal(t, uint64(0), udb.TimeSumUs)
+}
+
+// runStatsCtx returns a StatsCtx using the given filename and unit ID,
+// simulating a process run.  It doesn't close s; the caller is responsible for
+// simulating the process exit.
+func runStatsCtx(tb testing.TB, filename string, unitID func() uint32) (s *StatsCtx) {
+	tb.Helper()
+
+	return newTestStatsCtx(tb, Config{
+		Enabled:  true,
+		UnitID:   unitID,
+		Filename: filename,
+	})
+}
+
+func TestStatsCtx_RestartSameHourTopCounters(t *testing.T) {
+	ctx := context.Background()
+
+	var curHour uint32 = 100
+	filename := filepath.Join(t.TempDir(), "stats.db")
+
+	// The first "process": add an entry and snapshot the current unit, then
+	// crash without closing the database.
+	first := runStatsCtx(t, filename, func() uint32 { return curHour })
+	first.Update(&Entry{
+		Client: "192.0.2.1",
+		Domain: "example.org",
+		Result: RNotFiltered,
+	})
+	first.flushTick(ctx, time.Now().Add(time.Hour))
+
+	first.store.Swap(nil)
+
+	// The second "process" restarts within the same hour, adds another entry,
+	// and rolls the unit over.
+	second := runStatsCtx(t, filename, func() uint32 { return curHour })
+	second.Update(&Entry{
+		Client: "192.0.2.2",
+		Domain: "example.org",
+		Result: RNotFiltered,
+	})
+
+	curHour = 101
+	second.flushTick(ctx, time.Now().Add(time.Hour))
+	testutil.CleanupAndRequireSuccess(t, second.Close)
+
+	st := second.store.Load()
+	require.NotNil(t, st)
+
+	udb, err := st.loadUnit(ctx, 100)
+	require.NoError(t, err)
+	require.NotNil(t, udb)
+	assert.Equal(t, uint64(2), udb.NTotal)
+
+	// The top counters must count the completed hour exactly once, even
+	// though the bucket previously held a snapshot.
+	domains, err := st.loadTopDomains(ctx, maxDomains, false)
+	require.NoError(t, err)
+	assert.Equal(t, []countPair{{Name: "example.org", Count: 2}}, domains)
+}
+
+func TestStatsCtx_OrphanBucketTopCounters(t *testing.T) {
+	ctx := context.Background()
+
+	var curHour uint32 = 100
+	filename := filepath.Join(t.TempDir(), "stats.db")
+
+	// The first "process": add an entry and snapshot the current unit, then
+	// crash without closing the database.
+	first := runStatsCtx(t, filename, func() uint32 { return curHour })
+	first.Update(&Entry{
+		Client: "192.0.2.1",
+		Domain: "example.org",
+		Result: RNotFiltered,
+	})
+	first.flushTick(ctx, time.Now().Add(time.Hour))
+
+	first.store.Swap(nil)
+
+	// The second "process" restarts two hours later, so the snapshot of hour
+	// 100 becomes an orphan bucket, which the aggregated top counters must
+	// adopt.
+	curHour = 102
+	second := runStatsCtx(t, filename, func() uint32 { return curHour })
+	t.Cleanup(func() { require.NoError(t, second.Close()) })
+
+	st := second.store.Load()
+	require.NotNil(t, st)
+
+	domains, err := st.loadTopDomains(ctx, maxDomains, false)
+	require.NoError(t, err)
+	assert.Equal(t, []countPair{{Name: "example.org", Count: 1}}, domains)
+
+	// Add another entry for the same domain and roll the current unit over,
+	// aging the orphan bucket out of the retention window while keeping the
+	// completed hour 102 within it.
+	second.Update(&Entry{
+		Client: "192.0.2.2",
+		Domain: "example.org",
+		Result: RNotFiltered,
+	})
+
+	curHour = 124
+	second.flushTick(ctx, time.Now().Add(time.Hour))
+
+	// The top counters must only contain the data of the kept buckets: the
+	// aged-out orphan bucket is subtracted, but the completed hour 102 isn't,
+	// despite the orphan bucket never entering the top counters through the
+	// completion write.
+	domains, err = st.loadTopDomains(ctx, maxDomains, false)
+	require.NoError(t, err)
+	assert.Equal(t, []countPair{{Name: "example.org", Count: 1}}, domains)
+}
+
+func TestStore_InvalidResultCode(t *testing.T) {
+	ctx := context.Background()
+	filename := filepath.Join(t.TempDir(), "stats.db")
+
+	st, err := newStore(ctx, testLogger, filename)
+	require.NoError(t, err)
+	cleanupStore(t, st)
+
+	// A corrupted counter row must yield an error instead of a panic.
+	_, err = st.db.ExecContext(ctx,
+		"INSERT INTO stats_counters (bucket, result, count) VALUES (?, ?, ?)",
+		1, int64(resultLast), 1,
+	)
+	require.NoError(t, err)
+
+	_, err = st.loadUnit(ctx, 1)
+	require.Error(t, err)
+
+	_, err = st.loadCounters(ctx, 0, 2)
+	require.Error(t, err)
 }

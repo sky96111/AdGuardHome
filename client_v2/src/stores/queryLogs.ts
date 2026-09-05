@@ -25,6 +25,7 @@ type QueryLogsState = {
     logs: NormalizedQueryLogItem[];
     enabled: boolean;
     oldest: string;
+    oldestId: number;
     filter: QueryLogFilter;
     isFiltered: boolean;
     anonymize_client_ip: boolean;
@@ -45,6 +46,7 @@ const initialState: QueryLogsState = {
     logs: [],
     enabled: true,
     oldest: '',
+    oldestId: 0,
     filter: DEFAULT_LOGS_FILTER,
     isFiltered: false,
     anonymize_client_ip: false,
@@ -93,10 +95,17 @@ const getReasons = (filter?: QueryLogFilter): string[] => {
     return STATUS_TO_REASONS[status] ?? [];
 };
 
-const fetchLogsWithParams = async (olderThan: string, filter?: QueryLogFilter) => {
+const fetchLogsWithParams = async (
+    olderThan: string,
+    filter?: QueryLogFilter,
+    olderThanId = 0,
+) => {
     const params: Record<string, string | string[] | number | undefined> = {
         search: filter?.search ?? DEFAULT_LOGS_FILTER.search,
         older_than: olderThan,
+        // The row ID of the cursor makes the pagination not skip the entries
+        // sharing the cursor's timestamp.
+        older_than_id: olderThanId || undefined,
         limit: QUERY_LOGS_PAGE_LIMIT,
     };
     const reasons = getReasons(filter);
@@ -104,7 +113,11 @@ const fetchLogsWithParams = async (olderThan: string, filter?: QueryLogFilter) =
         params.reason = reasons;
     }
     const raw = await queryLog(params);
-    return { logs: normalizeLogs(raw.data || []), oldest: raw.oldest || '' };
+    return {
+        logs: normalizeLogs(raw.data || []),
+        oldest: raw.oldest || '',
+        oldestId: raw.oldest_id || 0,
+    };
 };
 
 /** Simple stateless filter: count entries matching the status */
@@ -118,20 +131,26 @@ const filterLogsByStatus = (
     return logs.filter((log) => reasons.includes(log.reason ?? ''));
 };
 
+type LogsPage = {
+    logs: NormalizedQueryLogItem[];
+    oldest: string;
+    oldestId: number;
+};
+
 const shortPollQueryLogs = async (
-    data: { logs: NormalizedQueryLogItem[]; oldest: string },
+    data: LogsPage,
     filter: QueryLogFilter,
-    total?: { logs: NormalizedQueryLogItem[]; oldest: string },
-): Promise<{ logs: NormalizedQueryLogItem[]; oldest: string }> => {
+    total?: LogsPage,
+): Promise<LogsPage> => {
     const totalData = total
-        ? { logs: [...total.logs, ...data.logs], oldest: data.oldest }
-        : { logs: data.logs, oldest: data.oldest };
+        ? { logs: [...total.logs, ...data.logs], oldest: data.oldest, oldestId: data.oldestId }
+        : data;
     const visible = filterLogsByStatus(
         totalData.logs,
         filter?.status || DEFAULT_LOGS_FILTER.status,
     ).length;
     if (visible >= QUERY_LOGS_PAGE_LIMIT || totalData.oldest === '') return totalData;
-    const more = await fetchLogsWithParams(totalData.oldest, filter);
+    const more = await fetchLogsWithParams(totalData.oldest, filter, totalData.oldestId);
     return shortPollQueryLogs(more, filter, totalData);
 };
 
@@ -140,13 +159,14 @@ const shortPollQueryLogs = async (
 export const getLogs = async (currentQuery?: string) => {
     setState('processingGetLogs', true);
     try {
-        const { isFiltered, filter, oldest } = untrack(() => state);
-        const data = await fetchLogsWithParams(oldest, filter);
+        const { isFiltered, filter, oldest, oldestId } = untrack(() => state);
+        const data = await fetchLogsWithParams(oldest, filter, oldestId);
         if (isFiltered) {
             const accumulated = await shortPollQueryLogs(data, filter);
             setState({
                 logs: accumulated.logs,
                 oldest: accumulated.oldest,
+                oldestId: accumulated.oldestId,
                 isEntireLog: accumulated.oldest === '',
                 processingGetLogs: false,
             });
@@ -154,6 +174,7 @@ export const getLogs = async (currentQuery?: string) => {
             setState({
                 logs: data.logs,
                 oldest: data.oldest,
+                oldestId: data.oldestId,
                 isEntireLog: data.oldest === '',
                 processingGetLogs: false,
             });
@@ -168,11 +189,12 @@ export const getLogs = async (currentQuery?: string) => {
 export const getAdditionalLogs = async () => {
     setState('processingAdditionalLogs', true);
     try {
-        const { filter, oldest } = untrack(() => state);
-        const data = await fetchLogsWithParams(oldest, filter);
+        const { filter, oldest, oldestId } = untrack(() => state);
+        const data = await fetchLogsWithParams(oldest, filter, oldestId);
         setState({
             logs: [...state.logs, ...data.logs],
             oldest: data.oldest,
+            oldestId: data.oldestId,
             isEntireLog: data.oldest === '',
             processingAdditionalLogs: false,
         });
@@ -189,6 +211,7 @@ export const clearLogs = async () => {
         setState({
             logs: [],
             oldest: '',
+            oldestId: 0,
             isEntireLog: false,
             processingClear: false,
         });
@@ -245,6 +268,7 @@ export const setFilteredLogs = async (filter?: QueryLogFilter): Promise<boolean>
         setState({
             logs: accumulated.logs,
             oldest: accumulated.oldest,
+            oldestId: accumulated.oldestId,
             isEntireLog: accumulated.oldest === '',
             filter: filter ?? DEFAULT_LOGS_FILTER,
             processingGetLogs: false,

@@ -72,7 +72,7 @@ func TestStats(t *testing.T) {
 	s, err := stats.New(context.Background(), conf)
 	require.NoError(t, err)
 
-	s.Start()
+	s.Start(context.Background())
 	testutil.CleanupAndRequireSuccess(t, s.Close)
 
 	t.Run("data", func(t *testing.T) {
@@ -195,7 +195,7 @@ func TestLargeNumbers(t *testing.T) {
 	s, err := stats.New(context.Background(), conf)
 	require.NoError(t, err)
 
-	s.Start()
+	s.Start(context.Background())
 	testutil.CleanupAndRequireSuccess(t, s.Close)
 
 	const (
@@ -247,7 +247,7 @@ func TestShouldCount(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	s.Start()
+	s.Start(context.Background())
 	testutil.CleanupAndRequireSuccess(t, s.Close)
 
 	testCases := []struct {

@@ -2,10 +2,8 @@ package querylog
 
 import (
 	"context"
-	"os"
 	"time"
 
-	"github.com/AdguardTeam/AdGuardHome/internal/aghos"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/logutil/slogutil"
 )
@@ -62,7 +60,7 @@ func (l *queryLog) drainBuffer() (entries []*logEntry) {
 }
 
 // periodicRetention periodically removes the entries that are older than the
-// configured interval.
+// configured interval.  It returns when ctx is canceled.
 func (l *queryLog) periodicRetention(ctx context.Context) {
 	defer slogutil.RecoverAndLog(ctx, l.logger)
 
@@ -76,8 +74,13 @@ func (l *queryLog) periodicRetention(ctx context.Context) {
 	retentions := time.NewTicker(retentionCheckIvl)
 	defer retentions.Stop()
 
-	for range retentions.C {
-		l.deleteOldEntries(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-retentions.C:
+			l.deleteOldEntries(ctx)
+		}
 	}
 }
 
@@ -132,20 +135,4 @@ func (l *queryLog) clear(ctx context.Context) {
 	}
 
 	l.logger.DebugContext(ctx, "cleared")
-}
-
-// chmodDBFiles makes sure the database files are only accessible by the
-// owner, as the log entries contain the full client IP addresses.  SQLite
-// creates the files with the mode of 0666 masked by the process umask.
-func chmodDBFiles(dbPath string) (err error) {
-	defer func() { err = errors.Annotate(err, "setting db file permissions: %w") }()
-
-	for _, p := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
-		err = os.Chmod(p, aghos.DefaultPermFile)
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
-	}
-
-	return nil
 }

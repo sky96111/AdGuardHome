@@ -7,18 +7,14 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"net/url"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
 
+	"github.com/AdguardTeam/AdGuardHome/internal/aghsqldb"
 	"github.com/AdguardTeam/AdGuardHome/internal/filtering"
 	"github.com/AdguardTeam/golibs/errors"
-	"github.com/ncruces/go-sqlite3"
-	"github.com/ncruces/go-sqlite3/driver"
 	"github.com/ncruces/go-sqlite3/ext/fts5"
 )
 
@@ -56,6 +52,11 @@ CREATE TABLE IF NOT EXISTS querylog (
 	ad           INTEGER NOT NULL
 );
 
+-- The idx_querylog_time index also contains the id column, although it's
+-- redundant for the plain time scans, because the rowid is the implicit last
+-- column of every index.  It's required by the keyset pagination predicate,
+-- which compares the (time, id) pairs to return the entries from newest to
+-- oldest without losing the entries sharing a timestamp at a page boundary.
 CREATE INDEX IF NOT EXISTS idx_querylog_time ON querylog (time, id);
 CREATE INDEX IF NOT EXISTS idx_querylog_host ON querylog (host);
 CREATE INDEX IF NOT EXISTS idx_querylog_client_ip ON querylog (client_ip);
@@ -121,7 +122,9 @@ type store struct {
 
 	// stmts contains the prepared search statements by their query text.
 	// The query text only varies by the combination of the applied filters,
-	// not by the filter values, so the cache is bounded and small.
+	// since the varying-width ID lists are bound through the json_each
+	// table-valued function and the reason lists are bounded by the number of
+	// the reasons, so the cache is bounded and small.
 	stmts map[string]*sql.Stmt
 }
 
@@ -130,7 +133,7 @@ type store struct {
 func newStore(ctx context.Context, logger *slog.Logger, dbPath string) (s *store, err error) {
 	defer func() { err = errors.Annotate(err, "opening querylog db: %w") }()
 
-	db, err := openDB(dbPath)
+	db, err := aghsqldb.Open(dbPath, fts5.Register)
 	if err != nil {
 		// Don't wrap the error, because it's informative enough as is.
 		return nil, err
@@ -149,7 +152,7 @@ func newStore(ctx context.Context, logger *slog.Logger, dbPath string) (s *store
 
 	// The WAL and SHM files are created by the first query, so make sure
 	// their permissions are fixed after the initialization as well.
-	err = chmodDBFiles(dbPath)
+	err = aghsqldb.ChmodFiles(dbPath)
 	if err != nil {
 		return nil, errors.WithDeferred(err, s.Close(ctx))
 	}
@@ -170,66 +173,6 @@ func (s *store) init(ctx context.Context) (err error) {
 	}
 
 	return nil
-}
-
-// openDB opens the SQLite database using the pure-Go driver with the pragmas
-// suitable for the query log workload.
-func openDB(dbPath string) (db *sql.DB, err error) {
-	defer func() { err = errors.Annotate(err, "opening db: %w") }()
-
-	// journal_mode(WAL) allows reading while writing; synchronous(NORMAL) is
-	// the recommended synchronous setting for WAL, since it doesn't fsync on
-	// each commit; auto_vacuum(INCREMENTAL) allows reclaiming the space of
-	// the deleted entries without rewriting the whole database.
-	const pragmas = "_pragma=busy_timeout(10000)" +
-		"&_pragma=journal_mode(WAL)" +
-		"&_pragma=synchronous(NORMAL)" +
-		"&_pragma=temp_store(MEMORY)" +
-		"&_pragma=auto_vacuum(INCREMENTAL)"
-
-	u := &url.URL{
-		Scheme:   "file",
-		Path:     uriPath(dbPath),
-		RawQuery: pragmas,
-	}
-
-	db, err = driver.Open(u.String(), func(conn *sqlite3.Conn) (err error) {
-		return fts5.Register(conn)
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	n := maxOpenConns()
-	db.SetMaxOpenConns(n)
-	db.SetMaxIdleConns(n)
-
-	return db, nil
-}
-
-// uriPath converts the platform-specific file path into the path component of
-// an SQLite URI filename.
-func uriPath(dbPath string) (p string) {
-	p = filepath.ToSlash(dbPath)
-	if runtime.GOOS == "windows" && filepath.IsAbs(dbPath) {
-		// "C:\dir\querylog.db" -> "/C:/dir/querylog.db", which is the form
-		// SQLite expects in URI filenames.
-		p = "/" + p
-	}
-
-	return p
-}
-
-// maxOpenConns returns the database connection pool size.  Each connection of
-// the pure-Go SQLite driver needs its own memory sandbox, which is especially
-// scarce on 32-bit platforms.
-func maxOpenConns() (n int) {
-	switch runtime.GOARCH {
-	case "386", "arm", "mips", "mipsle":
-		return 2
-	default:
-		return 4
-	}
 }
 
 // Close closes the store.  The store must not be used after that.
@@ -475,6 +418,7 @@ func scanLogEntry(scan func(dest ...any) error) (e *logEntry, err error) {
 		return nil, err
 	}
 
+	e.id = id
 	e.Time = time.Unix(0, timeNano)
 	e.IP = net.ParseIP(clientIP)
 	e.ClientProto = ClientProto(proto)
@@ -524,7 +468,17 @@ func buildSearchQuery(params *searchParams, lists clientIDLists) (sq *searchQuer
 	sq = &searchQuery{}
 
 	if !params.olderThan.IsZero() {
-		sq.add("time < ?", params.olderThan.UnixNano())
+		if params.olderThanID != 0 {
+			// The keyset predicate continues the pagination exactly after the
+			// entry identified by the (time, id) pair of the cursor, so that
+			// the entries sharing the cursor's timestamp aren't skipped.
+			sq.add("(time, id) < (?, ?)",
+				params.olderThan.UnixNano(),
+				params.olderThanID,
+			)
+		} else {
+			sq.add("time < ?", params.olderThan.UnixNano())
+		}
 	}
 
 	for i, c := range params.searchCriteria {
@@ -542,9 +496,9 @@ func buildSearchQuery(params *searchParams, lists clientIDLists) (sq *searchQuer
 
 	if len(lists.ignored) > 0 {
 		// Hide the entries of the clients that must not be logged.
-		ph := placeholders(len(lists.ignored))
-		sq.add("client_ip NOT IN ("+ph+")", lists.ignored...)
-		sq.add("client_id COLLATE NOCASE NOT IN ("+ph+")", lists.ignored...)
+		ignored := jsonIDs(lists.ignored)
+		sq.add("client_ip NOT IN (SELECT value FROM json_each(?))", ignored)
+		sq.add("client_id COLLATE NOCASE NOT IN (SELECT value FROM json_each(?))", ignored)
 	}
 
 	return sq
@@ -553,7 +507,7 @@ func buildSearchQuery(params *searchParams, lists clientIDLists) (sq *searchQuer
 // addTermCriterion adds the free-text search criterion c to the query.
 // idsByName contains the IDs of the clients whose names match the value of the
 // criterion, if any.
-func addTermCriterion(sq *searchQuery, c *searchCriterion, idsByName []any) {
+func addTermCriterion(sq *searchQuery, c *searchCriterion, idsByName []string) {
 	if strings.TrimSpace(c.value) == "" {
 		// A blank term matches everything.
 		return
@@ -590,7 +544,7 @@ func addIDSetCriterion(sq *searchQuery, branches []idBranch) {
 
 // addStrictTermCriterion adds an exact-match criterion over the domain name,
 // the client IP address, the client ID, and the client name.
-func addStrictTermCriterion(sq *searchQuery, c *searchCriterion, idsByName []any) {
+func addStrictTermCriterion(sq *searchQuery, c *searchCriterion, idsByName []string) {
 	// The stored domain names are lowercase.
 	branches := []idBranch{{
 		subquery: "SELECT id FROM querylog WHERE host = ?",
@@ -619,7 +573,7 @@ func addStrictTermCriterion(sq *searchQuery, c *searchCriterion, idsByName []any
 // name, the client IP address, the client ID, and the client name.  Terms long
 // enough are matched through the trigram FTS index, the short ones fall back
 // to scanning.
-func addNonStrictTermCriterion(sq *searchQuery, c *searchCriterion, idsByName []any) {
+func addNonStrictTermCriterion(sq *searchQuery, c *searchCriterion, idsByName []string) {
 	if maxRunes(c.value, c.asciiVal) >= trigramMinRunes {
 		addFTSTermCriterion(sq, c, idsByName)
 
@@ -642,14 +596,13 @@ func addNonStrictTermCriterion(sq *searchQuery, c *searchCriterion, idsByName []
 		args = append(args, likePattern(c.asciiVal))
 	}
 
-	ph := placeholders(len(idsByName))
-	if ph != "" {
+	if len(idsByName) > 0 {
+		ids := jsonIDs(idsByName)
 		conds = append(conds,
-			"client_ip IN ("+ph+")",
-			"client_id COLLATE NOCASE IN ("+ph+")",
+			"client_ip IN (SELECT value FROM json_each(?))",
+			"client_id COLLATE NOCASE IN (SELECT value FROM json_each(?))",
 		)
-		args = append(args, idsByName...)
-		args = append(args, idsByName...)
+		args = append(args, ids, ids)
 	}
 
 	sq.add("("+strings.Join(conds, " OR ")+")", args...)
@@ -658,7 +611,7 @@ func addNonStrictTermCriterion(sq *searchQuery, c *searchCriterion, idsByName []
 // addFTSTermCriterion adds a substring-match criterion that uses the trigram
 // FTS index.  idsByName contains the IDs of the clients whose names match the
 // value of the criterion, if any.
-func addFTSTermCriterion(sq *searchQuery, c *searchCriterion, idsByName []any) {
+func addFTSTermCriterion(sq *searchQuery, c *searchCriterion, idsByName []string) {
 	terms := []string{c.value}
 	if c.asciiVal != "" {
 		terms = append(terms, c.asciiVal)
@@ -676,20 +629,20 @@ func addFTSTermCriterion(sq *searchQuery, c *searchCriterion, idsByName []any) {
 
 // appendClientIDBranches appends the branches matching the client IP address
 // and client ID columns against ids, if any.
-func appendClientIDBranches(branches []idBranch, ids []any) []idBranch {
+func appendClientIDBranches(branches []idBranch, ids []string) []idBranch {
 	if len(ids) == 0 {
 		return branches
 	}
 
-	ph := placeholders(len(ids))
+	idsJSON := jsonIDs(ids)
 
 	return append(branches,
 		idBranch{
-			subquery: "SELECT id FROM querylog WHERE client_ip IN (" + ph + ")",
-			args:     ids,
+			subquery: "SELECT id FROM querylog WHERE client_ip IN (SELECT value FROM json_each(?))",
+			args:     []any{idsJSON},
 		}, idBranch{
-			subquery: "SELECT id FROM querylog WHERE client_id COLLATE NOCASE IN (" + ph + ")",
-			args:     ids,
+			subquery: "SELECT id FROM querylog WHERE client_id COLLATE NOCASE IN (SELECT value FROM json_each(?))",
+			args:     []any{idsJSON},
 		},
 	)
 }
@@ -770,6 +723,17 @@ func ftsMatchQuery(terms ...string) (query string) {
 // substring.
 func likePattern(val string) (pat string) {
 	return "%" + strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(val) + "%"
+}
+
+// jsonIDs encodes ids into a JSON array to be bound as the argument of the
+// json_each table-valued function of the search queries.  Passing the ID lists
+// as a single bound argument keeps the SQL text of the queries independent of
+// the number of the IDs, so that the prepared statements stay bounded.  The
+// encoding of a string slice never fails.
+func jsonIDs(ids []string) (s string) {
+	b, _ := json.Marshal(ids)
+
+	return string(b)
 }
 
 // placeholders returns an SQL list of n bound-parameter placeholders, e.g.

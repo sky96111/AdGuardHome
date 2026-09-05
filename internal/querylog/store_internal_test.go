@@ -134,7 +134,7 @@ func TestStore_EntryFidelity(t *testing.T) {
 	require.NoError(t, err)
 
 	params := newSearchParams()
-	got, oldest := l.search(ctx, params)
+	got, oldest, _ := l.search(ctx, params)
 	require.Len(t, got, 1)
 	assert.True(t, time0.Equal(oldest))
 
@@ -180,13 +180,15 @@ func TestStore_CursorPagination(t *testing.T) {
 	l := newTestDBQueryLog(t, t.TempDir(), nil)
 	ctx := testutil.ContextWithTimeout(t, testTimeout)
 
+	// The entries are made in pairs sharing a timestamp to make sure that the
+	// keyset pagination doesn't skip the entries at a page boundary.
 	const entNum = 20
 
 	start := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
 	entries := make([]*logEntry, 0, entNum)
 	for i := range entNum {
 		entries = append(entries, &logEntry{
-			Time:  start.Add(time.Duration(i) * time.Minute),
+			Time:  start.Add(time.Duration(i/2) * time.Minute),
 			QHost: fmt.Sprintf("host%d.example.org", i),
 			QType: "A",
 			// Only the entries without the question are skipped by the
@@ -199,11 +201,12 @@ func TestStore_CursorPagination(t *testing.T) {
 	err := l.store.insertBatch(ctx, entries)
 	require.NoError(t, err)
 
-	// Page through all the entries using the oldest cursor, like the frontend
+	// Page through all the entries using the keyset cursor, like the frontend
 	// does.
 	var (
 		got      []string
 		oldest   time.Time
+		oldestID int64
 		pageSize = 6
 	)
 
@@ -212,7 +215,7 @@ func TestStore_CursorPagination(t *testing.T) {
 
 	for range 10 {
 		var page []*logEntry
-		page, oldest = l.search(ctx, params)
+		page, oldest, oldestID = l.search(ctx, params)
 		require.NotEmpty(t, page)
 
 		for _, e := range page {
@@ -223,9 +226,10 @@ func TestStore_CursorPagination(t *testing.T) {
 			break
 		}
 
-		// The next page contains the entries strictly older than the oldest
-		// entry of the current page.
+		// The next page contains the entries strictly preceding the oldest
+		// entry of the current page in the (time, id) order.
 		params.olderThan = oldest
+		params.olderThanID = oldestID
 	}
 
 	require.Len(t, got, entNum)
@@ -286,7 +290,7 @@ func TestStore_FilteringStatus(t *testing.T) {
 		params := newSearchParams()
 		params.searchCriteria = criteria
 
-		found, _ := l.search(ctx, params)
+		found, _, _ := l.search(ctx, params)
 		for _, e := range found {
 			res = append(res, e.QHost)
 		}
@@ -390,7 +394,7 @@ func TestStore_TermSearch(t *testing.T) {
 		params := newSearchParams()
 		params.searchCriteria = criteria
 
-		found, _ := l.search(ctx, params)
+		found, _, _ := l.search(ctx, params)
 		for _, e := range found {
 			res = append(res, e.QHost)
 		}
@@ -524,7 +528,7 @@ func TestStore_ClientNameAndIgnore(t *testing.T) {
 		params := newSearchParams()
 		params.searchCriteria = []searchCriterion{parseTermCriterion(t, l, rawTerm)}
 
-		found, _ := l.search(ctx, params)
+		found, _, _ := l.search(ctx, params)
 		for _, e := range found {
 			res = append(res, e.QHost)
 		}
@@ -601,7 +605,7 @@ func TestStore_RetentionAndClear(t *testing.T) {
 	l.deleteOldEntries(ctx)
 
 	params := newSearchParams()
-	found, _ := l.search(ctx, params)
+	found, _, _ := l.search(ctx, params)
 	require.Len(t, found, 1)
 	assert.Equal(t, "kept.example.org", found[0].QHost)
 
@@ -610,20 +614,20 @@ func TestStore_RetentionAndClear(t *testing.T) {
 		value:         "old.example",
 		criterionType: ctTerm,
 	}}
-	found, _ = l.search(ctx, params)
+	found, _, _ = l.search(ctx, params)
 	assert.Empty(t, found)
 
 	params.searchCriteria = []searchCriterion{{
 		value:         "kept.example",
 		criterionType: ctTerm,
 	}}
-	found, _ = l.search(ctx, params)
+	found, _, _ = l.search(ctx, params)
 	require.Len(t, found, 1)
 
 	l.clear(ctx)
 
 	params.searchCriteria = nil
-	found, _ = l.search(ctx, params)
+	found, _, _ = l.search(ctx, params)
 	assert.Empty(t, found)
 }
 
@@ -637,7 +641,7 @@ func TestQueryLog_ConcurrentAddSearch(t *testing.T) {
 
 	// Trigger the search before the concurrent part to make sure the lazy
 	// initialization, if any, is done.
-	_, _ = l.search(ctx, newSearchParams())
+	_, _, _ = l.search(ctx, newSearchParams())
 
 	const (
 		goroutineNum = 4
@@ -669,7 +673,7 @@ func TestQueryLog_ConcurrentAddSearch(t *testing.T) {
 		params := newSearchParams()
 		params.limit = 10
 
-		entries, _ := l.search(ctx, params)
+		entries, _, _ := l.search(ctx, params)
 		assert.LessOrEqual(t, len(entries), 10)
 	}
 
@@ -679,7 +683,7 @@ func TestQueryLog_ConcurrentAddSearch(t *testing.T) {
 
 	params := newSearchParams()
 	params.limit = goroutineNum * entNum
-	entries, _ := l.search(ctx, params)
+	entries, _, _ := l.search(ctx, params)
 	assert.Len(t, entries, goroutineNum*entNum)
 }
 
@@ -780,7 +784,7 @@ func BenchmarkSearch(b *testing.B) {
 				params.limit = 500
 				bc.want(params)
 
-				entries, _ := l.search(ctx, params)
+				entries, _, _ := l.search(ctx, params)
 				if len(entries) == 0 {
 					b.Fatal("no entries found")
 				}
@@ -805,7 +809,7 @@ func TestSearchMemoryWithCriteria(t *testing.T) {
 		criterionType: ctTerm,
 	}}
 
-	entries, _ := l.search(ctx, params)
+	entries, _, _ := l.search(ctx, params)
 	require.Len(t, entries, 1)
 	assert.Equal(t, "blocked.example.org", entries[0].QHost)
 }

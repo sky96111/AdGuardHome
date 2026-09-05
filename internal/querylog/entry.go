@@ -17,6 +17,10 @@ type logEntry struct {
 	// client is the found client information, if any.
 	client *Client
 
+	// id is the database row ID of a stored entry.  It's zero for the entries
+	// that didn't come from the database.
+	id int64
+
 	Time time.Time `json:"T"`
 
 	QHost  string `json:"QH"`

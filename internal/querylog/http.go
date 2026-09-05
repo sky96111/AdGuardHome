@@ -88,14 +88,15 @@ func (l *queryLog) handleQueryLog(w http.ResponseWriter, r *http.Request) {
 
 	var entries []*logEntry
 	var oldest time.Time
+	var oldestID int64
 	func() {
 		l.confMu.RLock()
 		defer l.confMu.RUnlock()
 
-		entries, oldest = l.search(ctx, params)
+		entries, oldest, oldestID = l.search(ctx, params)
 	}()
 
-	resp := l.entriesToJSON(ctx, entries, oldest, l.anonymizer.Load())
+	resp := l.entriesToJSON(ctx, entries, oldest, oldestID, l.anonymizer.Load())
 
 	aghhttp.WriteJSONResponseOK(ctx, l.logger, w, r, resp)
 }
@@ -445,6 +446,16 @@ func (l *queryLog) parseSearchParams(
 		p.olderThan, err = time.Parse(time.RFC3339Nano, olderThan)
 		if err != nil {
 			return nil, err
+		}
+
+		// The row ID of the cursor is only meaningful together with its time.
+		if q.Has("older_than_id") {
+			var id64 int64
+			if id64, err = strconv.ParseInt(q.Get("older_than_id"), 10, 64); err != nil {
+				return nil, fmt.Errorf("parsing older_than_id: %w", err)
+			}
+
+			p.olderThanID = id64
 		}
 	}
 

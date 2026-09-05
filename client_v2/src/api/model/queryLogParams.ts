@@ -7,6 +7,14 @@ export type QueryLogParams = {
      */
     older_than?: string;
     /**
+     * The row ID of the oldest entry of the previous page, returned in the
+     * "oldest_id" response field.  Together with "older_than" it makes the
+     * pagination not skip the entries sharing that timestamp.  Older clients
+     * may omit it, in which case those entries may be skipped at a page
+     * boundary.
+     */
+    older_than_id?: number;
+    /**
      * Specify the ranking number of the first item on the page.  Even though it is possible to use "offset" and "older_than", we recommend choosing one of them and sticking to it.
      */
     offset?: number;
