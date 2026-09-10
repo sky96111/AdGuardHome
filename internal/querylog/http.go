@@ -89,12 +89,26 @@ func (l *queryLog) handleQueryLog(w http.ResponseWriter, r *http.Request) {
 	var entries []*logEntry
 	var oldest time.Time
 	var oldestID int64
+	var searchErr error
 	func() {
 		l.confMu.RLock()
 		defer l.confMu.RUnlock()
 
-		entries, oldest, oldestID = l.search(ctx, params)
+		entries, oldest, oldestID, searchErr = l.search(ctx, params)
 	}()
+	if searchErr != nil {
+		aghhttp.ErrorAndLog(
+			ctx,
+			l.logger,
+			r,
+			w,
+			http.StatusInternalServerError,
+			"searching: %s",
+			searchErr,
+		)
+
+		return
+	}
 
 	resp := l.entriesToJSON(ctx, entries, oldest, oldestID, l.anonymizer.Load())
 
@@ -103,8 +117,12 @@ func (l *queryLog) handleQueryLog(w http.ResponseWriter, r *http.Request) {
 
 // handleQueryLogClear is the handler for the POST /control/querylog/clear HTTP
 // API.
-func (l *queryLog) handleQueryLogClear(_ http.ResponseWriter, r *http.Request) {
-	l.clear(r.Context())
+func (l *queryLog) handleQueryLogClear(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	err := l.clear(ctx)
+	if err != nil {
+		aghhttp.ErrorAndLog(ctx, l.logger, r, w, http.StatusInternalServerError, "clearing: %s", err)
+	}
 }
 
 // handleQueryLogInfo is the handler for the GET /control/querylog_info HTTP
@@ -459,14 +477,14 @@ func (l *queryLog) parseSearchParams(
 		}
 	}
 
-	var limit64 int64
-	if limit64, err = strconv.ParseInt(q.Get("limit"), 10, 64); err == nil {
-		p.limit = int(limit64)
+	if limit, lerr := strconv.Atoi(q.Get("limit")); lerr == nil && limit > 0 {
+		// A non-positive LIMIT would return the whole table (LIMIT -1) or
+		// nothing, so ignore the invalid value and keep the default.
+		p.limit = limit
 	}
 
-	var offset64 int64
-	if offset64, err = strconv.ParseInt(q.Get("offset"), 10, 64); err == nil {
-		p.offset = int(offset64)
+	if offset, oerr := strconv.Atoi(q.Get("offset")); oerr == nil && offset >= 0 {
+		p.offset = offset
 	}
 
 	err = l.parseSearchCriterions(ctx, q, p)

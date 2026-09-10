@@ -3,7 +3,9 @@
 package aghsqldb
 
 import (
+	"context"
 	"database/sql"
+	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -18,17 +20,28 @@ import (
 // dataPragmas are the URL query parameters setting the PRAGMA statements
 // suitable for the AdGuard Home database workloads:
 //
+//   - busy_timeout(10000) makes the writers wait for the lock instead of
+//     failing immediately;
+//   - auto_vacuum(INCREMENTAL) allows reclaiming the space of the deleted
+//     entries without rewriting the whole database.  It must come before
+//     journal_mode(WAL), because switching to WAL initializes the database
+//     header and makes later auto_vacuum changes ineffective for new
+//     databases;
 //   - journal_mode(WAL) allows reading while writing;
 //   - synchronous(NORMAL) is the recommended synchronous setting for WAL,
 //     since it doesn't fsync on each commit;
-//   - auto_vacuum(INCREMENTAL) allows reclaiming the space of the deleted
-//     entries without rewriting the whole database;
 //   - temp_store(MEMORY) keeps the temporary tables and indices off the disk.
+//
+// The _txlock query parameter makes the driver begin the write transactions
+// with BEGIN IMMEDIATE, so that concurrent writers wait for the write lock up
+// to busy_timeout instead of failing with SQLITE_BUSY when a deferred
+// transaction is upgraded.
 const dataPragmas = "_pragma=busy_timeout(10000)" +
+	"&_pragma=auto_vacuum(INCREMENTAL)" +
 	"&_pragma=journal_mode(WAL)" +
 	"&_pragma=synchronous(NORMAL)" +
 	"&_pragma=temp_store(MEMORY)" +
-	"&_pragma=auto_vacuum(INCREMENTAL)"
+	"&_txlock=immediate"
 
 // Open opens the SQLite database at dbPath, creating it if necessary, using
 // the pure-Go driver with the [dataPragmas].  setupConn, if any, is invoked
@@ -103,6 +116,62 @@ func ChmodFiles(dbPath string) (err error) {
 		if err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
+	}
+
+	return nil
+}
+
+// Migration is a single schema migration of the database from the version
+// equal to its index to the next one.
+type Migration func(ctx context.Context, db *sql.DB) (err error)
+
+// EnsureSchemaVersion ensures that the schema version of the database is want,
+// using [PRAGMA user_version] as the version source.  migrations[i] migrates
+// the schema from version i to version i+1; a nil entry means that the step
+// requires no changes.  It returns an error if the database schema is newer
+// than want, so that an old binary never silently operates on a newer
+// database.
+func EnsureSchemaVersion(
+	ctx context.Context,
+	db *sql.DB,
+	want uint32,
+	migrations []Migration,
+) (err error) {
+	defer func() { err = errors.Annotate(err, "ensuring schema version: %w") }()
+
+	var got int64
+	err = db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&got)
+	if err != nil {
+		return fmt.Errorf("reading schema version: %w", err)
+	}
+
+	if got < 0 {
+		return fmt.Errorf("invalid schema version %d", got)
+	}
+
+	if uint64(got) > uint64(want) {
+		return fmt.Errorf(
+			"database schema version %d is newer than supported version %d",
+			got,
+			want,
+		)
+	}
+
+	for v := uint32(got); v < want; v++ {
+		i := int(v)
+		if i < len(migrations) && migrations[i] != nil {
+			err = migrations[i](ctx, db)
+			if err != nil {
+				return fmt.Errorf("migrating from version %d: %w", v, err)
+			}
+		}
+	}
+
+	// The pragma value can't be bound as a parameter, but want is an unsigned
+	// integer, so it's safe to format it into the statement.
+	_, err = db.ExecContext(ctx, fmt.Sprintf("PRAGMA user_version = %d", want))
+	if err != nil {
+		return fmt.Errorf("writing schema version: %w", err)
 	}
 
 	return nil

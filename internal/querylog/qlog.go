@@ -40,6 +40,10 @@ type queryLog struct {
 	// be modified.
 	buffer *container.RingBuffer[*logEntry]
 
+	// bufferSize is the capacity of buffer.  It's kept separately, because the
+	// ring buffer implementation doesn't expose it.
+	bufferSize uint
+
 	// store is the SQLite-backed storage of the query log.  It is nil if the
 	// query log works in the memory-only mode, i.e. FileEnabled is false.
 	store *store
@@ -50,6 +54,17 @@ type queryLog struct {
 	// flushLock synchronizes a flushing goroutine with searching and
 	// clearing.
 	flushLock sync.Mutex
+
+	// retentionWG tracks the periodic-retention goroutine, so that Shutdown
+	// waits for it to exit before closing the store.
+	retentionWG sync.WaitGroup
+
+	// flushCtx is the context of the periodic-retention goroutine.  It's
+	// created in Start and canceled in Shutdown.
+	flushCtx context.Context
+
+	// flushCancel cancels flushCtx.
+	flushCancel context.CancelFunc
 
 	flushPending bool
 }
@@ -92,7 +107,10 @@ func (l *queryLog) Start(ctx context.Context) (err error) {
 		l.initWeb()
 	}
 
-	go l.periodicRetention(ctx)
+	l.flushCtx, l.flushCancel = context.WithCancel(ctx)
+
+	l.retentionWG.Add(1)
+	go l.periodicRetention(l.flushCtx)
 
 	return nil
 }
@@ -102,17 +120,27 @@ func (l *queryLog) Shutdown(ctx context.Context) (err error) {
 	l.confMu.RLock()
 	defer l.confMu.RUnlock()
 
+	// Stop the periodic-retention goroutine and wait for it, so that it
+	// doesn't race with the store closure.
+	if l.flushCancel != nil {
+		l.flushCancel()
+	}
+	l.retentionWG.Wait()
+
 	if l.store == nil {
 		return nil
 	}
 
-	err = l.flushLogBuffer(ctx)
-	if err != nil {
-		// Don't wrap the error because it's informative enough as is.
-		return err
-	}
+	// The store must be closed even if the final flush fails, to perform the
+	// WAL checkpoint and release the resources.
+	defer func() {
+		cerr := l.store.Close(ctx)
+		err = errors.WithDeferred(err, cerr)
+	}()
 
-	return l.store.Close(ctx)
+	err = l.flushLogBuffer(ctx)
+
+	return err
 }
 
 func checkInterval(ivl time.Duration) (ok bool) {

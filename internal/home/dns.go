@@ -165,6 +165,7 @@ func initDNSServer(
 	globalContext.clients.clientChecker = globalContext.dnsServer
 
 	dnsConf, err := newServerConfig(
+		ctx,
 		&config.DNS,
 		config.Clients.Sources,
 		config.HTTPConfig.DoH,
@@ -258,6 +259,7 @@ func ipsToUDPAddrs(ips []netip.Addr, port uint16) (udpAddrs []*net.UDPAddr) {
 // newServerConfig converts values from the configuration file into the internal
 // DNS server configuration.  All arguments must not be nil.
 func newServerConfig(
+	ctx context.Context,
 	dnsConf *dnsConfig,
 	clientSrcConf *clientSourcesConfig,
 	dohConf *doHConfig,
@@ -300,7 +302,7 @@ func newServerConfig(
 	// [cmdlineUpdate].
 	if sts := globalContext.stats; sts != nil {
 		const initialClientsNum = 100
-		initialAddresses = globalContext.stats.TopClientsIP(initialClientsNum)
+		initialAddresses = globalContext.stats.TopClientsIP(ctx, initialClientsNum)
 	}
 
 	// Do not set DialContext, PrivateSubnets, and UsePrivateRDNS, because they

@@ -169,6 +169,8 @@ func newQueryLog(ctx context.Context, conf Config) (l *queryLog, err error) {
 
 		buffer: container.NewRingBuffer[*logEntry](memSize),
 
+		bufferSize: memSize,
+
 		conf:   &Config{},
 		confMu: &sync.RWMutex{},
 

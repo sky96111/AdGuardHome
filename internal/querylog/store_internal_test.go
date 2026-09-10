@@ -123,6 +123,16 @@ func newFullTestEntry(tb testing.TB, ts time.Time, host string, ip net.IP) (e *l
 	}
 }
 
+func TestStore_SchemaVersion(t *testing.T) {
+	l := newTestDBQueryLog(t, t.TempDir(), nil)
+	ctx := testutil.ContextWithTimeout(t, testTimeout)
+
+	var v int64
+	err := l.store.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&v)
+	require.NoError(t, err)
+	assert.Equal(t, int64(querylogSchemaVersion), v)
+}
+
 func TestStore_EntryFidelity(t *testing.T) {
 	l := newTestDBQueryLog(t, t.TempDir(), nil)
 	ctx := testutil.ContextWithTimeout(t, testTimeout)
@@ -134,7 +144,7 @@ func TestStore_EntryFidelity(t *testing.T) {
 	require.NoError(t, err)
 
 	params := newSearchParams()
-	got, oldest, _ := l.search(ctx, params)
+	got, oldest, _, _ := l.search(ctx, params)
 	require.Len(t, got, 1)
 	assert.True(t, time0.Equal(oldest))
 
@@ -215,7 +225,7 @@ func TestStore_CursorPagination(t *testing.T) {
 
 	for range 10 {
 		var page []*logEntry
-		page, oldest, oldestID = l.search(ctx, params)
+		page, oldest, oldestID, _ = l.search(ctx, params)
 		require.NotEmpty(t, page)
 
 		for _, e := range page {
@@ -290,7 +300,7 @@ func TestStore_FilteringStatus(t *testing.T) {
 		params := newSearchParams()
 		params.searchCriteria = criteria
 
-		found, _, _ := l.search(ctx, params)
+		found, _, _, _ := l.search(ctx, params)
 		for _, e := range found {
 			res = append(res, e.QHost)
 		}
@@ -394,7 +404,7 @@ func TestStore_TermSearch(t *testing.T) {
 		params := newSearchParams()
 		params.searchCriteria = criteria
 
-		found, _, _ := l.search(ctx, params)
+		found, _, _, _ := l.search(ctx, params)
 		for _, e := range found {
 			res = append(res, e.QHost)
 		}
@@ -528,7 +538,7 @@ func TestStore_ClientNameAndIgnore(t *testing.T) {
 		params := newSearchParams()
 		params.searchCriteria = []searchCriterion{parseTermCriterion(t, l, rawTerm)}
 
-		found, _, _ := l.search(ctx, params)
+		found, _, _, _ := l.search(ctx, params)
 		for _, e := range found {
 			res = append(res, e.QHost)
 		}
@@ -605,7 +615,7 @@ func TestStore_RetentionAndClear(t *testing.T) {
 	l.deleteOldEntries(ctx)
 
 	params := newSearchParams()
-	found, _, _ := l.search(ctx, params)
+	found, _, _, _ := l.search(ctx, params)
 	require.Len(t, found, 1)
 	assert.Equal(t, "kept.example.org", found[0].QHost)
 
@@ -614,21 +624,125 @@ func TestStore_RetentionAndClear(t *testing.T) {
 		value:         "old.example",
 		criterionType: ctTerm,
 	}}
-	found, _, _ = l.search(ctx, params)
+	found, _, _, _ = l.search(ctx, params)
 	assert.Empty(t, found)
 
 	params.searchCriteria = []searchCriterion{{
 		value:         "kept.example",
 		criterionType: ctTerm,
 	}}
-	found, _, _ = l.search(ctx, params)
+	found, _, _, _ = l.search(ctx, params)
 	require.Len(t, found, 1)
 
-	l.clear(ctx)
+	require.NoError(t, l.clear(ctx))
 
 	params.searchCriteria = nil
-	found, _, _ = l.search(ctx, params)
+	found, _, _, _ = l.search(ctx, params)
 	assert.Empty(t, found)
+}
+
+func TestStore_RetentionAndClearBatched(t *testing.T) {
+	l := newTestDBQueryLog(t, t.TempDir(), func(c *Config) {
+		c.RotationIvl = 90 * time.Minute
+	})
+	ctx := testutil.ContextWithTimeout(t, time.Minute)
+
+	now := time.Now()
+
+	// Use more entries than a single delete batch to exercise the chunked
+	// deletion, which must keep the FTS index in sync.
+	const (
+		oldNum = deleteChunkSize + 10
+		newNum = deleteChunkSize/2 + 7
+	)
+
+	entries := make([]*logEntry, 0, oldNum+newNum)
+	for i := range oldNum {
+		entries = append(entries, &logEntry{
+			Time:  now.Add(-2 * time.Hour),
+			QHost: fmt.Sprintf("old%d.example.org", i),
+			QType: "A",
+			IP:    testClientIPv4,
+		})
+	}
+
+	for i := range newNum {
+		entries = append(entries, &logEntry{
+			Time:  now.Add(-30 * time.Minute),
+			QHost: fmt.Sprintf("kept%d.example.org", i),
+			QType: "A",
+			IP:    testClientIPv4,
+		})
+	}
+
+	require.NoError(t, l.store.insertBatch(ctx, entries))
+
+	n, err := l.store.deleteOlderThan(ctx, now.Add(-time.Hour))
+	require.NoError(t, err)
+	assert.Equal(t, int64(oldNum), n)
+
+	// All the kept entries and none of the removed ones must remain.
+	params := newSearchParams()
+	params.limit = oldNum + newNum
+	found, _, _, err := l.search(ctx, params)
+	require.NoError(t, err)
+	require.Len(t, found, newNum)
+
+	// The FTS index must stay consistent after the batched delete.
+	params = newSearchParams()
+	params.limit = oldNum + newNum
+	params.searchCriteria = []searchCriterion{{
+		value:         "old.example",
+		criterionType: ctTerm,
+	}}
+	found, _, _, err = l.search(ctx, params)
+	require.NoError(t, err)
+	assert.Empty(t, found)
+
+	// Clear must remove the rest in batches as well.
+	require.NoError(t, l.clear(ctx))
+
+	params = newSearchParams()
+	params.limit = oldNum + newNum
+	found, _, _, err = l.search(ctx, params)
+	require.NoError(t, err)
+	assert.Empty(t, found)
+}
+
+func TestQueryLog_MemoryOnlyLimit(t *testing.T) {
+	l := newTestDBQueryLog(t, t.TempDir(), func(c *Config) {
+		c.FileEnabled = false
+		c.MemSize = 10
+	})
+	ctx := testutil.ContextWithTimeout(t, testTimeout)
+
+	for i := range 5 {
+		addTestEntry(
+			l,
+			fmt.Sprintf("host%d.example.org", i),
+			testAnswerIPv4,
+			testClientIPv4,
+			filtering.Rewritten,
+		)
+	}
+
+	params := newSearchParams()
+	params.limit = 3
+
+	found, _, _, err := l.search(ctx, params)
+	require.NoError(t, err)
+	assert.Len(t, found, params.limit)
+}
+
+func TestQueryLog_SearchDBError(t *testing.T) {
+	l := newTestDBQueryLog(t, t.TempDir(), nil)
+	ctx := testutil.ContextWithTimeout(t, testTimeout)
+
+	// Close the database behind the store to force a search failure.
+	require.NoError(t, l.store.db.Close())
+
+	_, _, _, err := l.search(ctx, newSearchParams())
+	require.Error(t, err)
 }
 
 func TestQueryLog_ConcurrentAddSearch(t *testing.T) {
@@ -641,7 +755,7 @@ func TestQueryLog_ConcurrentAddSearch(t *testing.T) {
 
 	// Trigger the search before the concurrent part to make sure the lazy
 	// initialization, if any, is done.
-	_, _, _ = l.search(ctx, newSearchParams())
+	_, _, _, _ = l.search(ctx, newSearchParams())
 
 	const (
 		goroutineNum = 4
@@ -673,7 +787,7 @@ func TestQueryLog_ConcurrentAddSearch(t *testing.T) {
 		params := newSearchParams()
 		params.limit = 10
 
-		entries, _, _ := l.search(ctx, params)
+		entries, _, _, _ := l.search(ctx, params)
 		assert.LessOrEqual(t, len(entries), 10)
 	}
 
@@ -683,7 +797,7 @@ func TestQueryLog_ConcurrentAddSearch(t *testing.T) {
 
 	params := newSearchParams()
 	params.limit = goroutineNum * entNum
-	entries, _, _ := l.search(ctx, params)
+	entries, _, _, _ := l.search(ctx, params)
 	assert.Len(t, entries, goroutineNum*entNum)
 }
 
@@ -784,7 +898,7 @@ func BenchmarkSearch(b *testing.B) {
 				params.limit = 500
 				bc.want(params)
 
-				entries, _, _ := l.search(ctx, params)
+				entries, _, _, _ := l.search(ctx, params)
 				if len(entries) == 0 {
 					b.Fatal("no entries found")
 				}
@@ -809,7 +923,7 @@ func TestSearchMemoryWithCriteria(t *testing.T) {
 		criterionType: ctTerm,
 	}}
 
-	entries, _, _ := l.search(ctx, params)
+	entries, _, _, _ := l.search(ctx, params)
 	require.Len(t, entries, 1)
 	assert.Equal(t, "blocked.example.org", entries[0].QHost)
 }

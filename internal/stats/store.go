@@ -129,6 +129,10 @@ const addTopUpstreamsSQL = `INSERT INTO stats_top_upstreams (upstream, responses
 // bbolt format of the previous version.
 var errLegacyDB errors.Error = "legacy statistics database"
 
+// statsSchemaVersion is the current version of the statistics database schema,
+// see [aghsqldb.EnsureSchemaVersion].
+const statsSchemaVersion = 1
+
 // store is a SQLite-backed storage of the statistics.  It is safe for
 // concurrent use through the [sql.DB] handle.
 type store struct {
@@ -202,6 +206,11 @@ func (s *store) init(ctx context.Context) (err error) {
 	_, err = s.db.ExecContext(ctx, storeSchema)
 	if err != nil {
 		return fmt.Errorf("creating schema: %w", err)
+	}
+
+	err = aghsqldb.EnsureSchemaVersion(ctx, s.db, statsSchemaVersion, nil)
+	if err != nil {
+		return fmt.Errorf("checking schema version: %w", err)
 	}
 
 	s.stmts = &storeStmts{}
@@ -344,28 +353,14 @@ func (s *store) persistUnit(ctx context.Context, id uint32, udb *unitDB, updateT
 		}
 	}()
 
-	if updateTops {
-		// The bucket may be written more than once, e.g. by the durability
-		// snapshots of its hour followed by the completion write, but only
-		// the completion writes enter the top counters.  Remove the
-		// contribution of the previous data of the bucket only if it's
-		// actually counted there.
-		covered, err := isTopCovered(ctx, tx, id)
-		if err != nil {
-			return err
-		}
-
-		if covered {
-			old, err := loadUnitTx(ctx, tx, id)
-			if err != nil {
-				return err
-			}
-
-			err = updateTopCounters(ctx, tx, s.stmts, old, -1)
-			if err != nil {
-				return err
-			}
-		}
+	// The bucket may be written more than once, e.g. by the durability
+	// snapshots of its hour followed by the completion write, or by a
+	// snapshot after the system clock jumped backwards and its hour
+	// reoccurred.  Remove the contribution of the previous data of the bucket
+	// if it's actually counted in the aggregated top counters.
+	covered, err := removeTopContribution(ctx, tx, s.stmts, id)
+	if err != nil {
+		return err
 	}
 
 	err = clearBucket(ctx, tx, id)
@@ -378,7 +373,10 @@ func (s *store) persistUnit(ctx context.Context, id uint32, udb *unitDB, updateT
 		return err
 	}
 
-	if updateTops {
+	// Add the new data of the bucket to the aggregated top counters if it's
+	// covered, so that the counters stay equal to the sum of the covered
+	// buckets, or if this is a completion write.
+	if covered || updateTops {
 		err = updateTopCounters(ctx, tx, s.stmts, udb, +1)
 		if err != nil {
 			return err
@@ -390,7 +388,9 @@ func (s *store) persistUnit(ctx context.Context, id uint32, udb *unitDB, updateT
 		if err != nil {
 			return err
 		}
+	}
 
+	if updateTops {
 		err = markTopCovered(ctx, tx, id)
 		if err != nil {
 			return err
@@ -403,6 +403,33 @@ func (s *store) persistUnit(ctx context.Context, id uint32, udb *unitDB, updateT
 	}
 
 	return nil
+}
+
+// removeTopContribution subtracts the contribution of the bucket id from the
+// aggregated top counters if it's currently covered.  It returns whether the
+// bucket was covered.
+func removeTopContribution(
+	ctx context.Context,
+	tx *sql.Tx,
+	stmts *storeStmts,
+	id uint32,
+) (covered bool, err error) {
+	covered, err = isTopCovered(ctx, tx, id)
+	if err != nil || !covered {
+		return covered, err
+	}
+
+	old, err := loadUnitTx(ctx, tx, id)
+	if err != nil {
+		return false, err
+	}
+
+	err = updateTopCounters(ctx, tx, stmts, old, -1)
+	if err != nil {
+		return false, err
+	}
+
+	return true, nil
 }
 
 // rebuildTopCounters recomputes the aggregated top counters and the covered
@@ -819,6 +846,16 @@ func (s *store) loadUnit(ctx context.Context, id uint32) (udb *unitDB, err error
 	return udb, tx.Commit()
 }
 
+// checkCount returns an error if count is negative, since converting a
+// negative int64 to uint64 would wrap around.
+func checkCount(count int64) (err error) {
+	if count < 0 {
+		return fmt.Errorf("negative count %d", count)
+	}
+
+	return nil
+}
+
 // loadUnitTx loads the bucket id from the database using tx.  It returns nil
 // if the bucket doesn't exist.
 func loadUnitTx(ctx context.Context, tx *sql.Tx, id uint32) (udb *unitDB, err error) {
@@ -838,6 +875,10 @@ func loadUnitTx(ctx context.Context, tx *sql.Tx, id uint32) (udb *unitDB, err er
 
 			if res < 0 || res >= int64(resultLast) {
 				return fmt.Errorf("invalid result code %d", res)
+			}
+
+			if err = checkCount(count); err != nil {
+				return err
 			}
 
 			udb.NResult[res] += uint64(count)
@@ -903,6 +944,10 @@ func loadDomainPairsTx(
 				return err
 			}
 
+			if err = checkCount(count); err != nil {
+				return err
+			}
+
 			pairs = append(pairs, countPair{Name: name, Count: uint64(count)})
 
 			return nil
@@ -919,6 +964,10 @@ func loadClientPairsTx(ctx context.Context, tx *sql.Tx, bucket int64) (pairs []c
 			var count int64
 			err = rows.Scan(&name, &count)
 			if err != nil {
+				return err
+			}
+
+			if err = checkCount(count); err != nil {
 				return err
 			}
 
@@ -942,6 +991,14 @@ func loadUpstreamPairsTx(
 			var respCount, timeSum int64
 			err = rows.Scan(&name, &respCount, &timeSum)
 			if err != nil {
+				return err
+			}
+
+			if err = checkCount(respCount); err != nil {
+				return err
+			}
+
+			if err = checkCount(timeSum); err != nil {
 				return err
 			}
 
@@ -1013,6 +1070,10 @@ func (s *store) loadCounters(
 				return fmt.Errorf("invalid result code %d", res)
 			}
 
+			if err = checkCount(count); err != nil {
+				return err
+			}
+
 			bucket := uint32(bucketID)
 			if perBucket[bucket] == nil {
 				perBucket[bucket] = make([]uint64, resultLast)
@@ -1059,6 +1120,10 @@ func (s *store) loadTopDomains(
 				return err
 			}
 
+			if err = checkCount(count); err != nil {
+				return err
+			}
+
 			pairs = append(pairs, countPair{Name: name, Count: uint64(count)})
 
 			return nil
@@ -1078,6 +1143,10 @@ func (s *store) loadTopClients(ctx context.Context, limit int) (pairs []countPai
 			var count int64
 			err = rows.Scan(&name, &count)
 			if err != nil {
+				return err
+			}
+
+			if err = checkCount(count); err != nil {
 				return err
 			}
 
@@ -1103,6 +1172,14 @@ func (s *store) loadTopUpstreams(
 			var respCount, timeSum int64
 			err = rows.Scan(&name, &respCount, &timeSum)
 			if err != nil {
+				return err
+			}
+
+			if err = checkCount(respCount); err != nil {
+				return err
+			}
+
+			if err = checkCount(timeSum); err != nil {
 				return err
 			}
 
@@ -1138,6 +1215,10 @@ WHERE bucket >= ? AND bucket < ? AND blocked = ? GROUP BY domain ORDER BY c DESC
 				return err
 			}
 
+			if err = checkCount(count); err != nil {
+				return err
+			}
+
 			pairs = append(pairs, countPair{Name: name, Count: uint64(count)})
 
 			return nil
@@ -1162,6 +1243,10 @@ WHERE bucket >= ? AND bucket < ? GROUP BY client ORDER BY c DESC LIMIT ?`,
 			var count int64
 			err = rows.Scan(&name, &count)
 			if err != nil {
+				return err
+			}
+
+			if err = checkCount(count); err != nil {
 				return err
 			}
 
@@ -1190,6 +1275,14 @@ WHERE bucket >= ? AND bucket < ? GROUP BY upstream ORDER BY r DESC LIMIT ?`,
 			var respCount, timeSum int64
 			err = rows.Scan(&name, &respCount, &timeSum)
 			if err != nil {
+				return err
+			}
+
+			if err = checkCount(respCount); err != nil {
+				return err
+			}
+
+			if err = checkCount(timeSum); err != nil {
 				return err
 			}
 

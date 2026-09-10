@@ -42,7 +42,7 @@ func newTestStatsCtx(tb testing.TB, c Config) (s *StatsCtx) {
 	}
 
 	var err error
-	s, err = New(context.TODO(), c)
+	s, err = New(context.Background(), c)
 	require.NoError(tb, err)
 
 	return s
@@ -80,7 +80,7 @@ func TestStats_races(t *testing.T) {
 
 		<-waitCh
 
-		_, _ = s.getData(context.TODO(), 24)
+		_, _ = s.getData(context.Background(), 24)
 	}
 
 	const (

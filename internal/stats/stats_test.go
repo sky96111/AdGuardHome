@@ -142,7 +142,7 @@ func TestStats(t *testing.T) {
 	})
 
 	t.Run("tops", func(t *testing.T) {
-		topClients := s.TopClientsIP(2)
+		topClients := s.TopClientsIP(context.Background(), 2)
 		require.NotEmpty(t, topClients)
 
 		assert.Equal(t, cliIP, topClients[0])

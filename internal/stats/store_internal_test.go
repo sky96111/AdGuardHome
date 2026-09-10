@@ -50,6 +50,20 @@ func testUnitDB() (udb *unitDB) {
 	}
 }
 
+func TestStore_SchemaVersion(t *testing.T) {
+	ctx := context.Background()
+	filename := filepath.Join(t.TempDir(), "stats.db")
+
+	st, err := newStore(ctx, testLogger, filename)
+	require.NoError(t, err)
+	cleanupStore(t, st)
+
+	var v int64
+	err = st.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&v)
+	require.NoError(t, err)
+	assert.Equal(t, int64(statsSchemaVersion), v)
+}
+
 func TestStore_PersistLoadRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	filename := filepath.Join(t.TempDir(), "stats.db")
@@ -123,6 +137,59 @@ func TestStore_ReplaceBucket(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, want.UpstreamsResponses, responses)
 	assert.Equal(t, want.UpstreamsTimeSum, timeSums)
+}
+
+func TestStore_SnapshotCoveredBucket(t *testing.T) {
+	ctx := context.Background()
+	filename := filepath.Join(t.TempDir(), "stats.db")
+
+	st, err := newStore(ctx, testLogger, filename)
+	require.NoError(t, err)
+	cleanupStore(t, st)
+
+	const id uint32 = 42
+
+	// Complete the hour, so that the bucket becomes covered by the top
+	// counters.
+	err = st.persistUnit(ctx, id, testUnitDB(), true)
+	require.NoError(t, err)
+
+	// A snapshot write for the same (covered) bucket.  It must keep the top
+	// counters consistent with the rows by subtracting the previous
+	// contribution and adding the new one.  This covers both erasing counts
+	// and adding them.
+	snap := &unitDB{
+		NResult:   []uint64{0, 0, 0, 0, 0, 2},
+		Domains:   []countPair{{Name: "other.example.org", Count: 2}},
+		Clients:   []countPair{{Name: "192.0.2.2", Count: 2}},
+		NTotal:    2,
+		TimeSumUs: 200,
+	}
+	err = st.persistUnit(ctx, id, snap, false)
+	require.NoError(t, err)
+
+	got, err := st.loadUnit(ctx, id)
+	require.NoError(t, err)
+	require.NotNil(t, got)
+	assert.Equal(t, snap, got)
+
+	// The top counters must match the per-bucket rows exactly.
+	domains, err := st.loadTopDomains(ctx, maxDomains, false)
+	require.NoError(t, err)
+	assert.Equal(t, snap.Domains, domains)
+
+	blocked, err := st.loadTopDomains(ctx, maxDomains, true)
+	require.NoError(t, err)
+	assert.Empty(t, blocked)
+
+	clients, err := st.loadTopClients(ctx, maxClients)
+	require.NoError(t, err)
+	assert.Equal(t, snap.Clients, clients)
+
+	responses, timeSums, err := st.loadTopUpstreams(ctx, maxUpstreams)
+	require.NoError(t, err)
+	assert.Empty(t, responses)
+	assert.Empty(t, timeSums)
 }
 
 func TestStore_DeleteBucketsBefore(t *testing.T) {
@@ -386,6 +453,29 @@ func TestStore_InvalidResultCode(t *testing.T) {
 	_, err = st.db.ExecContext(ctx,
 		"INSERT INTO stats_counters (bucket, result, count) VALUES (?, ?, ?)",
 		1, int64(resultLast), 1,
+	)
+	require.NoError(t, err)
+
+	_, err = st.loadUnit(ctx, 1)
+	require.Error(t, err)
+
+	_, err = st.loadCounters(ctx, 0, 2)
+	require.Error(t, err)
+}
+
+func TestStore_NegativeCount(t *testing.T) {
+	ctx := context.Background()
+	filename := filepath.Join(t.TempDir(), "stats.db")
+
+	st, err := newStore(ctx, testLogger, filename)
+	require.NoError(t, err)
+	cleanupStore(t, st)
+
+	// A negative counter would wrap around when converted to uint64, so it
+	// must be rejected on load.
+	_, err = st.db.ExecContext(ctx,
+		"INSERT INTO stats_counters (bucket, result, count) VALUES (?, ?, ?)",
+		1, 0, int64(-1),
 	)
 	require.NoError(t, err)
 

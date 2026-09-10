@@ -869,6 +869,7 @@ func (web *webAPI) writeTLSConfigureResponse(
 // reconfigureDNSServer reconfigures the DNS server.
 func (web *webAPI) reconfigureDNSServer(ctx context.Context) (err error) {
 	newConf, err := newServerConfig(
+		ctx,
 		&config.DNS,
 		config.Clients.Sources,
 		config.HTTPConfig.DoH,

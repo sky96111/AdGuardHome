@@ -100,11 +100,11 @@ func (l *queryLog) searchMemory(
 func (l *queryLog) search(
 	ctx context.Context,
 	params *searchParams,
-) (entries []*logEntry, oldest time.Time, oldestID int64) {
+) (entries []*logEntry, oldest time.Time, oldestID int64, err error) {
 	start := time.Now()
 
 	if params.limit == 0 {
-		return []*logEntry{}, time.Time{}, 0
+		return []*logEntry{}, time.Time{}, 0, nil
 	}
 
 	if l.store == nil {
@@ -114,13 +114,17 @@ func (l *queryLog) search(
 		entries, oldest = l.finalizeSearchResults(memoryEntries, params, time.Time{})
 	} else {
 		// Make sure that all the buffered entries are in the store, so that
-		// the search covers them as well.
-		err := l.flushLogBuffer(ctx)
-		if err != nil {
-			l.logger.ErrorContext(ctx, "flushing buffer before search", slogutil.KeyError, err)
+		// the search covers them as well.  A flush failure is logged but not
+		// fatal, since the search may still return the persisted entries.
+		flushErr := l.flushLogBuffer(ctx)
+		if flushErr != nil {
+			l.logger.ErrorContext(ctx, "flushing buffer before search", slogutil.KeyError, flushErr)
 		}
 
-		entries, oldest, oldestID = l.searchStore(ctx, params)
+		entries, oldest, oldestID, err = l.searchStore(ctx, params)
+		if err != nil {
+			return nil, time.Time{}, 0, err
+		}
 	}
 
 	l.logger.DebugContext(
@@ -131,7 +135,7 @@ func (l *queryLog) search(
 		"elapsed", time.Since(start),
 	)
 
-	return entries, oldest, oldestID
+	return entries, oldest, oldestID, nil
 }
 
 // searchStore searches the database using the specified parameters.  The
@@ -139,17 +143,15 @@ func (l *queryLog) search(
 func (l *queryLog) searchStore(
 	ctx context.Context,
 	params *searchParams,
-) (entries []*logEntry, oldest time.Time, oldestID int64) {
+) (entries []*logEntry, oldest time.Time, oldestID int64, err error) {
 	term, strict := searchTerm(params)
 	lists := l.clientIDLists(ctx, term, strict)
 
 	sq := buildSearchQuery(params, lists)
 
-	entries, err := l.store.search(ctx, sq, params.limit, params.offset)
+	entries, err = l.store.search(ctx, sq, params.limit, params.offset)
 	if err != nil {
-		l.logger.ErrorContext(ctx, "searching entries", slogutil.KeyError, err)
-
-		return nil, time.Time{}, 0
+		return nil, time.Time{}, 0, err
 	}
 
 	cache := clientCache{}
@@ -174,11 +176,11 @@ func (l *queryLog) searchStore(
 		oldestID = entries[len(entries)-1].id
 	}
 
-	return entries, oldest, oldestID
+	return entries, oldest, oldestID, nil
 }
 
-// finalizeSearchResults sorts entries and applies offset trimming, and updates
-// the oldest timestamp.  params must not be nil.
+// finalizeSearchResults sorts entries and applies offset and limit trimming,
+// and updates the oldest timestamp.  params must not be nil.
 func (l *queryLog) finalizeSearchResults(
 	entries []*logEntry,
 	params *searchParams,
@@ -198,6 +200,12 @@ func (l *queryLog) finalizeSearchResults(
 		} else {
 			return nil, time.Time{}
 		}
+	}
+
+	// The database path already applies the LIMIT clause, while the
+	// memory-only path must trim the entries here.
+	if params.limit > 0 && len(entries) > params.limit {
+		entries = entries[:params.limit]
 	}
 
 	if len(entries) > 0 {

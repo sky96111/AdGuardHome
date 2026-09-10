@@ -335,7 +335,7 @@ func (s *StatsCtx) getData(ctx context.Context, limit uint32) (resp *StatsResp, 
 		}, true
 	}
 
-	dbAgg, perBucketMap, dbTimeSumUs, curSnap, curID, ok := s.loadUnits(limit)
+	dbAgg, perBucketMap, dbTimeSumUs, curSnap, curID, ok := s.loadUnits(ctx, limit)
 	if !ok {
 		return &StatsResp{}, false
 	}

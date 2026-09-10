@@ -2,8 +2,10 @@ package querylog
 
 import (
 	"context"
+	"path/filepath"
 	"time"
 
+	"github.com/AdguardTeam/AdGuardHome/internal/aghsqldb"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/logutil/slogutil"
 )
@@ -27,8 +29,20 @@ func (l *queryLog) flushLogBuffer(ctx context.Context) (err error) {
 
 	start := time.Now()
 
-	err = l.store.insertBatch(ctx, entries)
+	// The buffer has already been drained, so the persistence of the entries
+	// must not be interrupted by the cancellation of the caller's context.
+	// A search request, for example, flushes the buffer and may be canceled
+	// by a disconnected client at any moment.  The database busy timeout
+	// provides the bounded wait instead.
+	insertCtx := context.WithoutCancel(ctx)
+
+	err = l.store.insertBatch(insertCtx, entries)
 	if err != nil {
+		// Return the drained entries to the buffer, so that a transient
+		// database failure, e.g. a busy timeout, doesn't lose the whole
+		// batch.
+		l.prependBuffer(entries)
+
 		return err
 	}
 
@@ -40,6 +54,43 @@ func (l *queryLog) flushLogBuffer(ctx context.Context) (err error) {
 	)
 
 	return nil
+}
+
+// prependBuffer puts entries back into the buffer before the entries that were
+// added while the flush was in progress, keeping the chronological order.  If
+// the buffer capacity is exceeded, the oldest entries are dropped, but an
+// error is logged to make the loss visible.
+func (l *queryLog) prependBuffer(entries []*logEntry) {
+	l.bufferLock.Lock()
+	defer l.bufferLock.Unlock()
+
+	var added []*logEntry
+	l.buffer.Range(func(e *logEntry) (cont bool) {
+		added = append(added, e)
+
+		return true
+	})
+
+	l.buffer.Clear()
+
+	if dropped := len(entries) + len(added) - int(l.bufferSize); dropped > 0 {
+		l.logger.Error(
+			"requeueing entries: buffer overflow, dropping entries",
+			"dropped", dropped,
+			"buffer_size", l.bufferSize,
+		)
+	}
+
+	for _, e := range entries {
+		l.buffer.Push(e)
+	}
+
+	for _, e := range added {
+		l.buffer.Push(e)
+	}
+
+	// Allow the next added entry to trigger a flush again.
+	l.flushPending = false
 }
 
 // drainBuffer returns all the buffered entries and resets the buffer.
@@ -62,6 +113,7 @@ func (l *queryLog) drainBuffer() (entries []*logEntry) {
 // periodicRetention periodically removes the entries that are older than the
 // configured interval.  It returns when ctx is canceled.
 func (l *queryLog) periodicRetention(ctx context.Context) {
+	defer l.retentionWG.Done()
 	defer slogutil.RecoverAndLog(ctx, l.logger)
 
 	l.deleteOldEntries(ctx)
@@ -108,11 +160,19 @@ func (l *queryLog) deleteOldEntries(ctx context.Context) {
 	if n > 0 {
 		l.logger.DebugContext(ctx, "deleted old entries", "count", n)
 	}
+
+	// SQLite can recreate the WAL and SHM sidecar files with the process umask,
+	// e.g. on a checkpoint, so reapply the restrictive permissions here, much
+	// more often than on the next start.
+	dbPath := filepath.Join(l.conf.BaseDir, querylogDBFileName)
+	err = aghsqldb.ChmodFiles(dbPath)
+	if err != nil {
+		l.logger.ErrorContext(ctx, "setting db file permissions", slogutil.KeyError, err)
+	}
 }
 
-// clear removes all the entries, both buffered and stored.  It implements the
-// POST /control/querylog_clear HTTP API.
-func (l *queryLog) clear(ctx context.Context) {
+// clear removes all the entries, both buffered and stored.
+func (l *queryLog) clear(ctx context.Context) (err error) {
 	l.flushLock.Lock()
 	defer l.flushLock.Unlock()
 
@@ -124,15 +184,15 @@ func (l *queryLog) clear(ctx context.Context) {
 	if l.store == nil {
 		l.logger.DebugContext(ctx, "cleared")
 
-		return
+		return nil
 	}
 
-	err := l.store.clear(ctx)
+	err = l.store.clear(ctx)
 	if err != nil {
-		l.logger.ErrorContext(ctx, "clearing log database", slogutil.KeyError, err)
-
-		return
+		return errors.Annotate(err, "clearing log database: %w")
 	}
 
 	l.logger.DebugContext(ctx, "cleared")
+
+	return nil
 }

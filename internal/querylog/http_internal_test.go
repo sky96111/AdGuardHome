@@ -136,6 +136,107 @@ func TestQuerylog_HandleQueryLog_reasonSearchCriterion(t *testing.T) {
 	}
 }
 
+// TestQuerylog_HandleQueryLog_dbError makes sure that a database failure
+// isn't reported as an empty successful response.
+func TestQuerylog_HandleQueryLog_dbError(t *testing.T) {
+	l := newTestQueryLog(t)
+	ctx := testutil.ContextWithTimeout(t, testTimeout)
+
+	// Flush the entries so that the search would normally return them.
+	require.NoError(t, l.flushLogBuffer(ctx))
+
+	// Close the database behind the store to force a search failure.
+	require.NoError(t, l.store.db.Close())
+
+	req := httptest.NewRequestWithContext(ctx, http.MethodGet, "/control/querylog", nil)
+	w := httptest.NewRecorder()
+
+	l.handleQueryLog(w, req)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
+// TestQuerylog_HandleQueryLogClear_dbError makes sure that a database failure
+// during the clear operation is reported.
+func TestQuerylog_HandleQueryLogClear_dbError(t *testing.T) {
+	l := newTestQueryLog(t)
+	ctx := testutil.ContextWithTimeout(t, testTimeout)
+
+	require.NoError(t, l.store.db.Close())
+
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/control/querylog_clear", nil)
+	w := httptest.NewRecorder()
+
+	l.handleQueryLogClear(w, req)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
+// TestQueryLog_ParseSearchParams_limitOffset makes sure that the invalid
+// limit and offset values are ignored instead of reaching the SQL query.
+func TestQueryLog_ParseSearchParams_limitOffset(t *testing.T) {
+	l := newTestQueryLog(t)
+	ctx := testutil.ContextWithTimeout(t, testTimeout)
+
+	testCases := []struct {
+		name       string
+		rawQuery   string
+		wantLimit  int
+		wantOffset int
+	}{{
+		name:       "default",
+		rawQuery:   "",
+		wantLimit:  500,
+		wantOffset: 0,
+	}, {
+		name:       "zero_limit",
+		rawQuery:   "limit=0",
+		wantLimit:  500,
+		wantOffset: 0,
+	}, {
+		name:       "negative_limit",
+		rawQuery:   "limit=-1",
+		wantLimit:  500,
+		wantOffset: 0,
+	}, {
+		name:       "invalid_limit",
+		rawQuery:   "limit=abc",
+		wantLimit:  500,
+		wantOffset: 0,
+	}, {
+		name:       "valid_limit",
+		rawQuery:   "limit=10",
+		wantLimit:  10,
+		wantOffset: 0,
+	}, {
+		name:       "negative_offset",
+		rawQuery:   "offset=-5",
+		wantLimit:  500,
+		wantOffset: 0,
+	}, {
+		name:       "valid_offset",
+		rawQuery:   "offset=5",
+		wantLimit:  500,
+		wantOffset: 5,
+	}}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequestWithContext(
+				ctx,
+				http.MethodGet,
+				"/control/querylog?"+tc.rawQuery,
+				nil,
+			)
+
+			p, err := l.parseSearchParams(ctx, req)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantLimit, p.limit)
+			assert.Equal(t, tc.wantOffset, p.offset)
+		})
+	}
+}
+
 // newTestQueryLog is a helper that returns new *queryLog initialized with
 // common test values.  It also adds several test entries.
 func newTestQueryLog(tb testing.TB) (l *queryLog) {

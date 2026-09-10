@@ -16,13 +16,17 @@ import (
 	"github.com/AdguardTeam/AdGuardHome/internal/agh"
 	"github.com/AdguardTeam/AdGuardHome/internal/aghhttp"
 	"github.com/AdguardTeam/AdGuardHome/internal/aghnet"
+	"github.com/AdguardTeam/AdGuardHome/internal/aghsqldb"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/golibs/timeutil"
 )
 
 // flushCheckIvl is the period of time between checking the need for flushing
-// the current unit to the database.
+// the current unit to the database.  The requests that arrive after the hour
+// boundary but before the next tick are still attributed to the previous
+// hour, so the attribution offset is bounded by this interval.  It's accepted,
+// since the statistics are aggregated per hour anyway.
 const flushCheckIvl = time.Minute
 
 // snapshotIvl is the period of time between refreshing the persisted snapshot
@@ -99,7 +103,7 @@ type Interface interface {
 
 	// GetTopClientIP returns at most limit IP addresses corresponding to the
 	// clients with the most number of requests.
-	TopClientsIP(limit uint) []netip.Addr
+	TopClientsIP(ctx context.Context, limit uint) []netip.Addr
 
 	// WriteDiskConfig puts the Interface's configuration to the dc.
 	WriteDiskConfig(dc *Config)
@@ -285,6 +289,9 @@ func (s *StatsCtx) Close() (err error) {
 	s.flushWG.Wait()
 
 	defer func() {
+		// The io.Closer interface doesn't accept a context, so the shutdown
+		// operations use a background context instead of the caller's one.
+		// There is no caller context to preserve here.
 		cerr := st.Close(context.TODO())
 		if cerr == nil {
 			s.logger.Debug("database closed")
@@ -369,7 +376,7 @@ func (s *StatsCtx) WriteDiskConfig(dc *Config) {
 }
 
 // TopClientsIP implements the [Interface] interface for *StatsCtx.
-func (s *StatsCtx) TopClientsIP(maxCount uint) (ips []netip.Addr) {
+func (s *StatsCtx) TopClientsIP(ctx context.Context, maxCount uint) (ips []netip.Addr) {
 	s.confMu.RLock()
 	defer s.confMu.RUnlock()
 
@@ -392,9 +399,6 @@ func (s *StatsCtx) TopClientsIP(maxCount uint) (ips []netip.Addr) {
 	if st == nil {
 		return nil
 	}
-
-	// TODO(s.chzhen):  Pass context.
-	ctx := context.TODO()
 
 	// The database part of the top list is exact, since any client beyond it
 	// can't enter the final top list without also being in the current
@@ -432,7 +436,10 @@ func (s *StatsCtx) TopClientsIP(maxCount uint) (ips []netip.Addr) {
 // updates block on currMu.
 func (s *StatsCtx) flushTick(ctx context.Context, now time.Time) {
 	// Track the database operations for the closers and the clearers of the
-	// database.
+	// database.  The Add must happen before the store is loaded: Close swaps
+	// the store to nil before calling Wait, so a tick that has already added
+	// itself is always waited for, while a tick that loads the store after the
+	// swap sees nil and performs no database operations.
 	s.flushWG.Add(1)
 	defer s.flushWG.Done()
 
@@ -454,6 +461,14 @@ func (s *StatsCtx) flushTick(ctx context.Context, now time.Time) {
 	st := s.store.Load()
 	if st == nil {
 		return
+	}
+
+	// SQLite can recreate the WAL and SHM sidecar files with the process umask,
+	// e.g. on a checkpoint, so reapply the restrictive permissions on every
+	// tick.
+	chmodErr := aghsqldb.ChmodFiles(s.filename)
+	if chmodErr != nil {
+		s.logger.Error("setting db file permissions", slogutil.KeyError, chmodErr)
 	}
 
 	// Snapshot the current unit, replacing it with an empty one on the hour
@@ -700,7 +715,10 @@ func (s *StatsCtx) loadAggregates(
 // loadUnits returns the aggregates of the buckets in the
 // [curID - limit + 1, curID) range along with the snapshot of the current
 // unit and its ID.  ok is false if the statistics aren't available.
-func (s *StatsCtx) loadUnits(limit uint32) (dbAgg *unitDB, perBucket map[uint32][]uint64, timeSumUs uint64, curSnap *unitDB, curID uint32, ok bool) {
+func (s *StatsCtx) loadUnits(
+	ctx context.Context,
+	limit uint32,
+) (dbAgg *unitDB, perBucket map[uint32][]uint64, timeSumUs uint64, curSnap *unitDB, curID uint32, ok bool) {
 	curSnap, curID = s.loadUnitSnapshot()
 	if curSnap == nil {
 		return nil, nil, 0, nil, 0, false
@@ -715,9 +733,6 @@ func (s *StatsCtx) loadUnits(limit uint32) (dbAgg *unitDB, perBucket map[uint32]
 	// matches the whole retention.  Otherwise, the custom range requested by
 	// the recent parameter is aggregated from the per-bucket rows.
 	windowed := limit != configured
-
-	// TODO(s.chzhen):  Pass context.
-	ctx := context.TODO()
 
 	dbAgg, perBucket, timeSumUs, err := s.loadAggregates(ctx, curID-limit+1, curID, windowed)
 	if err != nil {

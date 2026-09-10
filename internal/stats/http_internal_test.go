@@ -149,7 +149,7 @@ func populateTestData(tb testing.TB, s *StatsCtx) {
 	st := s.store.Load()
 	require.NotNil(tb, st)
 
-	err := st.persistUnit(context.TODO(), uint32(oldUnitID), oldUnit, true)
+	err := st.persistUnit(context.Background(), uint32(oldUnitID), oldUnit, true)
 	require.NoError(tb, err)
 
 	s.Update(&Entry{

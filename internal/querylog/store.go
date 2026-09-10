@@ -15,12 +15,17 @@ import (
 	"github.com/AdguardTeam/AdGuardHome/internal/aghsqldb"
 	"github.com/AdguardTeam/AdGuardHome/internal/filtering"
 	"github.com/AdguardTeam/golibs/errors"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/ncruces/go-sqlite3/ext/fts5"
 )
 
 // querylogDBFileName is the name of the SQLite database file containing the
 // query log.
 const querylogDBFileName = "querylog.db"
+
+// querylogSchemaVersion is the current version of the query log database
+// schema, see [aghsqldb.EnsureSchemaVersion].
+const querylogSchemaVersion = 1
 
 // storeSchema is the SQL schema of the query log database.  The reason and
 // is_filtered columns are denormalized copies of the fields of the result
@@ -52,11 +57,12 @@ CREATE TABLE IF NOT EXISTS querylog (
 	ad           INTEGER NOT NULL
 );
 
--- The idx_querylog_time index also contains the id column, although it's
--- redundant for the plain time scans, because the rowid is the implicit last
--- column of every index.  It's required by the keyset pagination predicate,
--- which compares the (time, id) pairs to return the entries from newest to
--- oldest without losing the entries sharing a timestamp at a page boundary.
+-- The idx_querylog_time index also lists the id column explicitly, although
+-- it's redundant, because the rowid is the implicit last column of every
+-- index, so (time, id) and (time) are equivalent.  It makes the keyset
+-- pagination predicate, which compares the (time, id) pairs, explicit.  The
+-- predicate returns the entries from newest to oldest without losing the
+-- entries sharing a timestamp at a page boundary.
 CREATE INDEX IF NOT EXISTS idx_querylog_time ON querylog (time, id);
 CREATE INDEX IF NOT EXISTS idx_querylog_host ON querylog (host);
 CREATE INDEX IF NOT EXISTS idx_querylog_client_ip ON querylog (client_ip);
@@ -117,7 +123,7 @@ type store struct {
 	// batch.  It must not be nil after init.
 	insertStmt *sql.Stmt
 
-	// stmtsMu protects stmts.
+	// stmtsMu protects stmts and closed.
 	stmtsMu sync.Mutex
 
 	// stmts contains the prepared search statements by their query text.
@@ -126,6 +132,9 @@ type store struct {
 	// table-valued function and the reason lists are bounded by the number of
 	// the reasons, so the cache is bounded and small.
 	stmts map[string]*sql.Stmt
+
+	// closed is true after Close.  It's protected by stmtsMu.
+	closed bool
 }
 
 // newStore opens the SQLite database at dbPath, creating it if necessary, and
@@ -167,6 +176,16 @@ func (s *store) init(ctx context.Context) (err error) {
 		return fmt.Errorf("creating schema: %w", err)
 	}
 
+	err = aghsqldb.EnsureSchemaVersion(ctx, s.db, querylogSchemaVersion, nil)
+	if err != nil {
+		return fmt.Errorf("checking schema version: %w", err)
+	}
+
+	// Check the FTS index consistency, but don't rebuild it automatically,
+	// since a rebuild is expensive for large databases.  A mismatch is
+	// reported to the operator instead.
+	s.checkFTSIntegrity(ctx)
+
 	s.insertStmt, err = s.db.PrepareContext(ctx, insertEntrySQL)
 	if err != nil {
 		return fmt.Errorf("preparing insert statement: %w", err)
@@ -175,16 +194,37 @@ func (s *store) init(ctx context.Context) (err error) {
 	return nil
 }
 
+// checkFTSIntegrity checks the consistency of the FTS index with the content
+// table and logs an error if it's inconsistent.  It doesn't return an error,
+// since the query log remains usable even with a stale free-text index.
+func (s *store) checkFTSIntegrity(ctx context.Context) {
+	_, err := s.db.ExecContext(
+		ctx,
+		`INSERT INTO querylog_fts (querylog_fts) VALUES ('integrity-check')`,
+	)
+	if err != nil {
+		s.logger.ErrorContext(ctx, "checking querylog fts index", slogutil.KeyError, err)
+	}
+}
+
 // Close closes the store.  The store must not be used after that.
 func (s *store) Close(ctx context.Context) (err error) {
 	defer func() { err = errors.Annotate(err, "closing querylog db: %w") }()
+
+	s.stmtsMu.Lock()
+	if s.closed {
+		s.stmtsMu.Unlock()
+
+		return nil
+	}
+
+	s.closed = true
 
 	// Update the query planner statistics before closing, as recommended by
 	// the SQLite documentation.  Ignore the error, since there is nothing to
 	// do about it at this point.
 	_, _ = s.db.ExecContext(ctx, "PRAGMA optimize")
 
-	s.stmtsMu.Lock()
 	for _, stmt := range s.stmts {
 		err = errors.WithDeferred(err, stmt.Close())
 	}
@@ -200,10 +240,20 @@ func (s *store) Close(ctx context.Context) (err error) {
 }
 
 // insertBatch inserts all the entries in a single transaction.  On error, the
-// entries are considered lost, which is the same behavior the previous file
-// storage had.
+// entries are considered lost, unless the caller returns them to the buffer,
+// see [queryLog.flushLogBuffer].
 func (s *store) insertBatch(ctx context.Context, entries []*logEntry) (err error) {
 	defer func() { err = errors.Annotate(err, "inserting entries: %w") }()
+
+	s.stmtsMu.Lock()
+	if s.closed || s.insertStmt == nil {
+		s.stmtsMu.Unlock()
+
+		return errors.Error("store is closed")
+	}
+
+	stmt := s.insertStmt
+	s.stmtsMu.Unlock()
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -216,7 +266,7 @@ func (s *store) insertBatch(ctx context.Context, entries []*logEntry) (err error
 		}
 	}()
 
-	txStmt := tx.StmtContext(ctx, s.insertStmt)
+	txStmt := tx.StmtContext(ctx, stmt)
 
 	for i, e := range entries {
 		var args []any
@@ -282,19 +332,20 @@ func (s *store) search(ctx context.Context, sq *searchQuery, limit, offset int) 
 	return entries, nil
 }
 
+// deleteChunkSize is the maximum number of the entries removed by a single
+// delete statement.  Batching prevents the retention and clear operations
+// from holding the SQLite write lock for a long time while the per-row FTS
+// triggers fire.
+const deleteChunkSize = 1000
+
 // deleteOlderThan removes the entries older than cutoff and returns the number
 // of the removed entries.
 func (s *store) deleteOlderThan(ctx context.Context, cutoff time.Time) (n int64, err error) {
 	defer func() { err = errors.Annotate(err, "deleting old entries: %w") }()
 
-	res, err := s.db.ExecContext(ctx, "DELETE FROM querylog WHERE time < ?", cutoff.UnixNano())
+	n, err = s.deleteChunks(ctx, "time < ?", []any{cutoff.UnixNano()})
 	if err != nil {
-		return 0, err
-	}
-
-	n, err = res.RowsAffected()
-	if err != nil {
-		return 0, err
+		return n, err
 	}
 
 	if n > 0 {
@@ -312,11 +363,92 @@ func (s *store) deleteOlderThan(ctx context.Context, cutoff time.Time) (n int64,
 	return n, err
 }
 
+// deleteChunks removes the entries matching cond in batches of
+// [deleteChunkSize], returning the total number of the removed entries.  cond
+// is an SQL predicate referencing the querylog table and args are its
+// arguments.
+func (s *store) deleteChunks(ctx context.Context, cond string, args []any) (n int64, err error) {
+	var lastID int64
+	for {
+		if err = ctx.Err(); err != nil {
+			return n, err
+		}
+
+		var ids []int64
+		ids, err = s.selectDeleteIDs(ctx, cond, args, lastID)
+		if err != nil {
+			return n, err
+		}
+
+		if len(ids) == 0 {
+			return n, nil
+		}
+
+		lastID = ids[len(ids)-1]
+
+		delArgs := make([]any, len(ids))
+		for i, id := range ids {
+			delArgs[i] = id
+		}
+
+		_, err = s.db.ExecContext(
+			ctx,
+			"DELETE FROM querylog WHERE id IN ("+placeholders(len(ids))+")",
+			delArgs...,
+		)
+		if err != nil {
+			return n, err
+		}
+
+		n += int64(len(ids))
+	}
+}
+
+// selectDeleteIDs returns up to [deleteChunkSize] identifiers of the entries
+// matching cond, in ascending ID order, starting after afterID.  cond is an SQL
+// predicate referencing the querylog table and args are its arguments.
+func (s *store) selectDeleteIDs(
+	ctx context.Context,
+	cond string,
+	args []any,
+	afterID int64,
+) (ids []int64, err error) {
+	query := "SELECT id FROM querylog WHERE id > ? AND (" + cond + ") ORDER BY id LIMIT ?"
+
+	queryArgs := make([]any, 0, len(args)+2)
+	queryArgs = append(queryArgs, afterID)
+	queryArgs = append(queryArgs, args...)
+	queryArgs = append(queryArgs, deleteChunkSize)
+
+	rows, err := s.db.QueryContext(ctx, query, queryArgs...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { err = errors.WithDeferred(err, rows.Close()) }()
+
+	for rows.Next() {
+		var id int64
+		err = rows.Scan(&id)
+		if err != nil {
+			return nil, err
+		}
+
+		ids = append(ids, id)
+	}
+
+	err = rows.Err()
+	if err != nil {
+		return nil, err
+	}
+
+	return ids, nil
+}
+
 // clear removes all the entries and reclaims their space.
 func (s *store) clear(ctx context.Context) (err error) {
 	defer func() { err = errors.Annotate(err, "clearing querylog db: %w") }()
 
-	_, err = s.db.ExecContext(ctx, "DELETE FROM querylog")
+	_, err = s.deleteChunks(ctx, "1", nil)
 	if err != nil {
 		return err
 	}
@@ -331,6 +463,10 @@ func (s *store) clear(ctx context.Context) (err error) {
 func (s *store) stmt(query string) (stmt *sql.Stmt, err error) {
 	s.stmtsMu.Lock()
 	defer s.stmtsMu.Unlock()
+
+	if s.closed {
+		return nil, errors.Error("store is closed")
+	}
 
 	if stmt, ok := s.stmts[query]; ok {
 		return stmt, nil
