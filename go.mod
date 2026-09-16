@@ -38,14 +38,14 @@ require (
 	go.etcd.io/bbolt v1.5.0
 	// TODO(e.burkov): Update to a stable tag.
 	go.yaml.in/yaml/v4 v4.0.0-rc.6
-	golang.org/x/crypto v0.55.0
-	golang.org/x/net v0.58.0
-	golang.org/x/sys v0.47.0
+	golang.org/x/crypto v0.57.0
+	golang.org/x/net v0.59.0
+	golang.org/x/sys v0.48.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 	howett.net/plist v1.0.1
 )
 
-require github.com/ncruces/go-sqlite3 v0.35.4
+require github.com/ncruces/go-sqlite3 v0.35.5
 
 require (
 	cloud.google.com/go v0.123.0 // indirect
@@ -78,7 +78,7 @@ require (
 	github.com/kisielk/errcheck v1.20.0 // indirect
 	github.com/mdlayher/socket v0.6.1 // indirect
 	github.com/mitchellh/mapstructure v1.5.0 // indirect
-	github.com/ncruces/go-sqlite3-wasm/v5 v5.0.35304 // indirect
+	github.com/ncruces/go-sqlite3-wasm/v6 v6.2.35304 // indirect
 	github.com/ncruces/julianday v1.0.0 // indirect
 	github.com/openai/openai-go/v3 v3.52.0 // indirect
 	github.com/patrickmn/go-cache v2.1.0+incompatible // indirect
@@ -106,12 +106,12 @@ require (
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/exp v0.0.0-20260813180055-c1d0aacb2297 // indirect
 	golang.org/x/exp/typeparams v0.0.0-20260813180055-c1d0aacb2297 // indirect
-	golang.org/x/mod v0.40.0 // indirect
-	golang.org/x/sync v0.22.0 // indirect
-	golang.org/x/telemetry v0.0.0-20260814151720-d8c169486af1 // indirect
-	golang.org/x/term v0.45.0 // indirect
-	golang.org/x/text v0.41.0 // indirect
-	golang.org/x/tools v0.49.0 // indirect
+	golang.org/x/mod v0.41.0 // indirect
+	golang.org/x/sync v0.23.0 // indirect
+	golang.org/x/telemetry v0.0.0-20260908163034-4bcc4b2ee518 // indirect
+	golang.org/x/term v0.46.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
+	golang.org/x/tools v0.50.0 // indirect
 	golang.org/x/vuln v1.7.0 // indirect
 	gonum.org/v1/gonum v0.17.0 // indirect
 	google.golang.org/api v0.293.0 // indirect
