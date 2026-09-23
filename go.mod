@@ -45,7 +45,7 @@ require (
 	howett.net/plist v1.0.1
 )
 
-require github.com/ncruces/go-sqlite3 v0.35.5
+require github.com/ncruces/go-sqlite3 v0.35.6
 
 require (
 	cloud.google.com/go v0.123.0 // indirect
@@ -78,7 +78,7 @@ require (
 	github.com/kisielk/errcheck v1.20.0 // indirect
 	github.com/mdlayher/socket v0.6.1 // indirect
 	github.com/mitchellh/mapstructure v1.5.0 // indirect
-	github.com/ncruces/go-sqlite3-wasm/v6 v6.2.35304 // indirect
+	github.com/ncruces/go-sqlite3-wasm/v6 v6.3.35304 // indirect
 	github.com/ncruces/julianday v1.0.0 // indirect
 	github.com/openai/openai-go/v3 v3.52.0 // indirect
 	github.com/patrickmn/go-cache v2.1.0+incompatible // indirect
